@@ -1,0 +1,806 @@
+---
+title: "DE Analysis for Tuberculosis"
+author: "Gabe Bronk"
+date: "2024-09-17"
+output: html_document
+---
+
+## This script is the pipeline for differential expression analysis for tuberculosis.
+## It performs 8 steps (steps 1 to 3 and 5 to 9. Note step 4 was removed and is not necessary).
+
+## The script requires the user to put parameter values and options of their choosing in the beginning of the script (up until the point where the script says "NO MORE INPUTS ARE NEEDED BEYOND THIS POINT") - see below. 
+
+## Before you run this script, in the same folder as this script is in you need to create folders named "OutputFiles" and "CorrectedCountsMatrices" which will store files created by this script.
+
+## This file DifferentialExpressionAnalysisPipelineMainScript.Rmd loads up and organizes the data. The actual analyses are carried out in other scripts called Step1.R, Step2.R,... Step8.R. These scripts are sourced by this main script, so when you run this main script, it will automatically run the other scripts.
+
+
+##------------------------------------------------------------------------------
+
+Here is a description of each step:
+
+1) First it determines if any covariates are correlated with the outcome (where the outcome is TB progressor vs non progressor, or TB infection vs non-infected, or TB disease vs no disease, or TB infection or disease vs no infection).
+
+2) This takes about 24 hours to complete. First it corrects the counts matrix for sequencing batch and technical variables. Next it uses the corrected counts to perform differential expression analysis (using DESeq2) - it simply uses case vs control in the DESeq2 model and does not include any covariates in the model in this step (the technical variables have been used in counts correction, as I just mentioned, but demographic/clinical covariates are not used in this step). The script performs backwards selection to find the set of technical variables that, when used to correct the counts matrix, results in the most differentially expressed genes (DEGs) for the case vs. control. We then select that set of technical variables (the one that yielded the most DEGs), and we obtain a list of putative DEGs (putative because we do not know yet if they are a result of confounding, which we will control for in steps below.)
+
+3) This takes several hours to complete. I determine which covariates are correlated with which RNAs. I do so using the N covariates found in step (1) to be correlated with the outcome. I run DESeq2 N times, each time including a different one of these covariates in the DESeq2 model (the model contains only that covariate, not the TB outcome). Thus we obtain a list of RNAs that are correlated with each covariate. 
+
+(no step 4)
+
+5) Based on the output of step (3), I determine which sets of covariates may be confounding each DEG found in step (2). This produces a list of the M confounding covariate sets.
+
+6) This takes about 24 hours to complete. I run DESeq2 again, this time running it M times, each time with a different confounding covariate set from step (5).
+
+7) I assemble a final DEG list, using the results from step (6), where the p-value for each DEG is from the DESeq2 run in step (6) that used that DEG's confounding covariate set in the DESeq2 model.
+
+8) This takes several hours to several days to complete. Using the RNAs found in the final DEG list from step (7), for each of these RNAs, I perform Bayesian logistic regression to determine the relative risk of the outcome (e.g. progression to TB disease) for individuals with the highest expression levels vs individuals with the lowest expression levels. To run this faster, run each RNA as a separate parallel job.
+
+9) This formats the final DEG list.
+
+##------------------------------------------------------------------------------
+
+## First set the file path:
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, warn=-1)
+
+## Write your directory name here:
+MyDirectory = 'c:/Users/gbron/OneDrive - Mass General Brigham/Documents/AKlengelLab/R01Project/GitHubForTB/DifferentialExpressionAnalysisPipeline'
+
+knitr::opts_knit$set(root.dir = MyDirectory)
+
+```
+
+## Input your selections here (i.e. which options you want to use):
+
+```{r}
+library(DESeq2)
+library(readxl)
+library(tictoc)
+library(brglm)
+
+SectionToRun = 1
+## This refers to which step of the script you want to run. Pick 1, 2, 3, 5, 6, 7, 8, or 9
+
+## Choose what your output files should be called:
+## IMPORTANT: If you run multiple analyses (e.g. Infected vs Uninfected, and TB vs Non-TB), use different
+## names here so that one analysis doesn't overwrite the files of the previous analysis.
+StringForOutputFileName = 'OutputFiles' 
+
+## Choose the folder in which your output files will be stored (CREATE THIS FOLDER FIRST):
+Folder = 'OutputFiles'  
+
+## These are the names of the output files that will be saved:
+FileNameStep2 = paste(Folder, '/', StringForOutputFileName, 'OutputStep2.RData', sep = "")
+FileNameStep3 = paste(Folder, '/', StringForOutputFileName, 'OutputStep3.RData', sep = "")
+FileNameStep5 = paste(Folder, '/', StringForOutputFileName, 'OutputStep5.RData', sep = "")
+FileNameStep6 = paste(Folder, '/', StringForOutputFileName, 'OutputStep6.RData', sep = "")
+FileNameStep7 = paste(Folder, '/', StringForOutputFileName, 'OutputStep7.RData', sep = "")
+FileNameStep8 = paste(Folder, '/', StringForOutputFileName, 'OutputStep8.RData', sep = "")
+
+## The name of the folder containing data that is necessary to run this script:
+PathForDataToLoad = 'c:/Users/gbron/OneDrive - Mass General Brigham/Documents/AKlengelLab/R01Project/GitHubForTB/Data'
+
+CorrectionOption = 1 
+## Choose from one of the following options in regards to correcting the counts matrix for batch and/or technical variables:
+## Option 1: if you want to correct the full counts matrix for all 1815 samples. This is slow.
+## Option 2: load up the already-corrected counts matrices. This is much faster, but you have had to previously have run Option 1 so that they corrected counts matrix files are available for loading.
+
+Step2Option = 2
+## If running backwards selection of technical variables (i.e. Step 2), choose which option you want: 
+## Option 1: Backwards selection that sequentially excludes the technical variable that is correlated with the fewest RNAs.
+## Option 2: Backwards selection using the "sameness score".
+  
+PlotCountsMatrixOption = 0
+## Option 0: Do nothing.
+## Option 1: Make a plot that confirms whether the corrected counts matrix no longer correlates with covariates.
+
+```
+
+
+
+# Loading the Data:
+
+```{r}
+setwd(PathForDataToLoad)
+
+## The count matrix:
+MyData = read.csv("RawCountMatrix.csv", header = FALSE)
+
+## This contains covariate information:
+GeneralDataOfFamilies = as.data.frame(read_excel('CovariateSpreadsheet1.xlsx'))
+
+## These two files I only use because they tell me which shortpids correspond to which barcodes. 
+## Shortpids are the IDs for each mother/child pair. Barcodes are the IDs for each sample (i.e. an individual's blood draw at a particular time point):
+GeneralDataR01 = as.data.frame(read_excel('CovariateSpreadsheet2.xlsx'))
+GeneralDataU01 = as.data.frame(read_excel('CovariateSpreadsheet3.xlsx'))
+
+## This contains the sequencing, library, and extraction batch info:
+BatchDF = read.csv('Batches.csv')   
+## Reformatting BatchDF:
+rownames(BatchDF) = BatchDF[,1]
+BatchDF = BatchDF[,-1]
+
+## This contains the information for RNA Integrity Numbers (RIN):
+FinalRINDF = read.csv("RNAIntegrityNumbers.csv", header = TRUE)
+## This contains other technical variables related to RNA sequencing:
+TechnicalMatrix = as.data.frame(read_excel('TechnicalCovariatesFromMultiQC.xlsx'))
+
+## This loads SmokingAndHouseDensityDataRTI, the matrix with information on household density and the composite smoking exposure score:
+load('SmokingAndHouseDensityForBirthRNAKids.RData')
+## RTI Stands for RNA Timepoint to Investigate (i.e. the time of blood extraction), which means we are lookings specifically at the birth timepoint.
+
+##------------------------------------------------------------------------------
+## Now we load the barcodes for the individuals. The barcode is the unique identifier for an individual at a particular time point. This loads these barcodes at the birth timepoint:
+load('BarcodesOfOutcomeGroups.RData')
+## The arrays loaded are:
+## BarcodesOfTB refers to kids who get TB disease.
+## BarcodesOfAINoIsoniazid refers to kids who become Asymptomatic Infected (i.e. non-progressors) with Mtb and did not receive prophylaxis.
+## BarcodesOfInfectedOrTB refers to kids who become asymptomatic infected with Mtb or contracted TB disease (includes kids who received prophylaxis or did not). 
+## BarcodesOfNonDisease refers to kids who did not contract TB (this includes kids who are asymptomatic infected who did not receive prophylaxis, and uninfected kids).
+## BarcodesOfNonInfected refers to kids who never get infected (by never, I mean never within the time frame of our study). 
+
+```
+
+
+## Select what will be the topic of your analysis:
+
+```{r}
+
+## For BarcodesOfTetsKids and BarcodesOfControlKids, pick from the arrays listed above which ones you will be comparing if differential expression analysis:
+
+BarcodesOfTestKids = BarcodesOfInfectedOrTB 
+BarcodesOfControlKids = BarcodesOfNonInfected
+
+```
+
+
+## Set the covariates to use based on the findings of Step 1 (i.e. first run Step 1 below and then 
+## fill in this section):
+
+```{r}
+
+## Write the covariate you want to use in CovariateArray:
+CovariateArray = c( 'Prenatal_smoking_composite',
+                    'birth_weight_standardized',
+                    'household_income_binary',
+                    'number_in_household_standardized',
+                    'sex',
+                    'child_hiv_birth',
+                    'MaternalDepression',
+                    'Prenatal_alcohol_composite' )
+
+  
+## Write the classes of the covariates in CovariateClassArray (in the same order that corresponds to CovariateArray):
+## 0 indicates a 2-level factor. 
+## 1 indicates a continuous variable. 
+## 2 Indicates a multi-level factor.
+CovariateClassArray = c(0, 1, 0, 1, 0, 0, 0, 0) 
+
+NumberOfSignificantCovariates = length(CovariateArray)  
+ContrastMatrix = matrix(0, NumberOfSignificantCovariates, 3)
+
+## Write the names of the covariates and levels here (in the same order as CovariateArray):
+ContrastMatrix[1, ] = c('Prenatal_smoking_composite', 'Yes', 'No')
+  ## (Nothing needed for the 2nd and 4th covariates because they are continuous).
+ContrastMatrix[3, ] = c('household_income_binary', 'poor', 'middle')
+
+ContrastMatrix[5, ] = c('sex', 'Female', 'Male')
+ContrastMatrix[6, ] = c('child_hiv_birth', 'HIV exposed uninfected', 'HIV unexposed')
+ContrastMatrix[7, ] = c('MaternalDepression', '1', '0')
+ContrastMatrix[8, ] = c('Prenatal_alcohol_composite', 'Exposure', 'No Exposure')
+  
+
+##------------------------------------------------------------------------------
+
+CovariateNumberToNeverExclude = c(3,10)
+## This is the Technical Variable numbers to never exclude in backwards selection. In other words, it is technical variables that should always be used for correcting the count matrix because these technical variables are correlated with the outcome, and we want to get rid of confounding. You determine which technical variables (and their corresponding numbers) using Step 1.
+## The technical variables and their corresponding numbers are:
+#1) ErrorRate               
+#2) MNonPrimary             
+#3) PercentMapped           
+#4) FivePrimeTo3PrimeBias   
+#5) MAligned15              
+#6) PercentGC               
+#7) rRNArate                
+#8) IntergenicRate          
+#9) ExonicRate              
+#10) DuplicationRateOfMapped 
+#11) AverageInsertSize      
+#12) TotalReads              
+#13) RIN                     
+
+
+
+
+```
+
+
+## After you run Step 2, fill in the variables in this section:
+
+```{r}
+
+## This is the best trial of backwards selection (write which trial identifies the most differentialy expressed genes):
+IndexOfBestTrial = 5  
+## This is the type of backwards selection you use:
+CountsMatrixString = 'Sameness'
+## Write 'Fewest' if running backwards selection where technical variables are eliminated based on having the fewest correlated RNAs/
+## Write 'Sameness' if running backwards selection where technical variables are eliminated based on the sameness score.
+                 
+```
+
+
+##==============================================================================
+##==============================================================================
+## NO MORE INPUTS ARE NEEDED BELOW THIS POINT (i.e. you do not have to edit the script below here)
+##==============================================================================
+##==============================================================================
+
+
+```{r}
+setwd(MyDirectory)
+
+NumberOfTestKids = length(BarcodesOfTestKids)
+NumberOfControlKids = length(BarcodesOfControlKids)
+NumberOfKidsOfInterest = NumberOfTestKids + NumberOfControlKids
+BarcodesOfInterest = c(BarcodesOfTestKids,BarcodesOfControlKids)
+
+## This is used by DESeq2 when running differential expression analysis for a binary variable (e.g. TB progressor vs. non-progressor):
+ContrastVariables = c("CaseOrControl",'B','A') 
+## These are the groups that will be compared in DESeq2. 
+## Because A is written last, A is the reference, so if we see an increase in 
+## expression, it means that B is expressed more than A.
+MyReferenceLevel = 'A'
+
+```
+
+
+## This section reformats the data frames:
+
+```{r}
+##------------------------------------------------------------------------------
+## First we reformat the data frames containing covariate information:
+##------------------------------------------------------------------------------
+
+R01ShortpidsAndBarcodes = GeneralDataR01[,c('shortpid','Barcode')] 
+U01ShortpidsAndBarcodes = GeneralDataU01[,c('shortpid','Barcode')]
+R01AndU01ShortpidsAndBarcodes = rbind(R01ShortpidsAndBarcodes,U01ShortpidsAndBarcodes)
+
+GeneralDataOfFamiliesNecessaryCovariates = GeneralDataOfFamilies[,c('shortpid', 'sex', 'R01_maternal_phenotype_breakdown', 'child_hiv_birth',	'ethnicity',	'education',	'household_income',	'work',	'Prenatal_alcohol_composite',	'smokecat_anc',	'gestation_delivery',	'preterm',	'birth_weight', 'Food_insecurity_ANC', 'Food_insecurity_14wk')]
+rownames(GeneralDataOfFamiliesNecessaryCovariates) = GeneralDataOfFamiliesNecessaryCovariates[,'shortpid']
+
+GeneralData = GeneralDataOfFamiliesNecessaryCovariates[R01AndU01ShortpidsAndBarcodes$shortpid,]
+rownames(GeneralData) = R01AndU01ShortpidsAndBarcodes$Barcode
+GeneralData$Barcode = R01AndU01ShortpidsAndBarcodes$Barcode
+
+## Making Depression and PTSD be separate covariates (rather than being grouped together as "PTSD AND Depression"):
+DepressionIndices = which(GeneralData$R01_maternal_phenotype_breakdown == 'Depression only')
+PTSDIndices = which(GeneralData$R01_maternal_phenotype_breakdown == 'PTSD only')
+PTSDAndDepressionIndices = which(GeneralData$R01_maternal_phenotype_breakdown == 'PTSD and Depression')
+GeneralData[,'MaternalDepression'] = 0
+GeneralData[,'MaternalPTSD'] = 0
+GeneralData[DepressionIndices,'MaternalDepression'] = 1
+GeneralData[PTSDAndDepressionIndices,'MaternalDepression'] = 1
+GeneralData[PTSDIndices,'MaternalPTSD'] = 1
+GeneralData[PTSDAndDepressionIndices,'MaternalPTSD'] = 1
+
+##------------------------------------------------------------------------------
+## Now we reformat the count matrix:
+##------------------------------------------------------------------------------
+
+## Reformatting the count matrix:
+MyDataWithHeaders = MyData[-1,]
+colnames(MyDataWithHeaders) = MyData[1,]
+RawCountsMatrix = MyDataWithHeaders[,-1]
+rownames(RawCountsMatrix) = MyDataWithHeaders[,1]
+
+IndicesOfExpressedRNAs = which(rowSums(RawCountsMatrix)>0)
+
+## This section arranges the Counts Matrix columns in ascending order of Barcodes:
+Barcodes = colnames(RawCountsMatrix)
+OrderedBarcodes = Barcodes[order(Barcodes)] 
+OrderedCountsMatrix = RawCountsMatrix[IndicesOfExpressedRNAs, OrderedBarcodes]
+
+AllBarcodes = TechnicalMatrix$Barcode
+NumberOfSamples = length(AllBarcodes)
+
+```
+
+
+
+## Putting the barcodes of the individuals in an order that we will use for the rest of the script:
+
+```{r}
+
+##-------------------------------------------------------------------
+## I will compare kids' RNA within a particular time point of interest.
+## However, when correcting the count matrix for sequencing batch and other technical variables,
+## I use all 1815 samples (i.e. all time points for kids and mothers) so that 
+## I best control for batch and technical variables.
+##------------------------------------------------------------------------------
+
+LogicalsOfNeitherPeople = AllBarcodes %in% c(BarcodesOfTestKids,BarcodesOfControlKids)
+IndicesOfNeitherPeople = which(LogicalsOfNeitherPeople == FALSE)
+BarcodesOfNeitherPeople = AllBarcodes[IndicesOfNeitherPeople]
+
+CurrentBarcodesToAnalyze = c(BarcodesOfTestKids,BarcodesOfControlKids,BarcodesOfNeitherPeople)
+
+```
+
+
+## Editing the RIN Data and Technical Matrix of technical variables: 
+
+```{r}
+
+##------------------------------------------------------------------------------
+## This section centers the RIN values because otherwise R gives me the following warning:
+## The design formula contains one or more numeric variables that have mean or
+## standard deviation larger than 5 (an arbitrary threshold to trigger this message).
+## Including numeric variables with large mean can induce collinearity with the intercept.
+## Users should center and scale numeric variables in the design to improve GLM convergence.
+
+rownames(FinalRINDF) = FinalRINDF$Barcode
+FinalRINDF$RIN = as.numeric(FinalRINDF$RIN)
+MeanRIN = mean(FinalRINDF$RIN)
+CenteredRINDF = FinalRINDF
+CenteredRINDF$RIN = FinalRINDF$RIN - MeanRIN
+
+##------------------------------------------------------------------------------
+## Now we center and scale every Technical Variable:
+
+rownames(TechnicalMatrix) = TechnicalMatrix$Barcode
+## Column 20 is removed because I don't believe the Average Read Lengths (since all the U01 samples
+## have the same average read length)
+TechnicalMatrixReformatted = TechnicalMatrix[,-c(1,20)]
+FinalTechnicalMatrix = TechnicalMatrixReformatted
+
+NumberOfTechnicalVariables = dim(TechnicalMatrixReformatted)[2]
+## CN stands for Column Number:
+for (CN in 1:NumberOfTechnicalVariables){
+  ColumnMean = mean(TechnicalMatrixReformatted[,CN])
+  ColumnStdDev = sd(TechnicalMatrixReformatted[,CN])
+  FinalTechnicalMatrix[,CN] = ( TechnicalMatrixReformatted[,CN] - ColumnMean )/ColumnStdDev 
+}  
+
+TypeOfBatch = 'SequencingBatch' ## This indicates that we will correct the count matrix for sequencing batch.
+
+```
+
+
+## Creating the Metadata table: 
+
+```{r} 
+
+##==============================================================================
+## Creating the Metadata Table:
+##==============================================================================
+
+## First we include the covariates:
+Metadata = data.frame('sex' = as.factor(GeneralData[CurrentBarcodesToAnalyze,'sex']))
+rownames(Metadata) = CurrentBarcodesToAnalyze
+Metadata[,'child_hiv_birth'] = as.factor(GeneralData[CurrentBarcodesToAnalyze,'child_hiv_birth'])
+Metadata[,'ethnicity'] = as.factor(GeneralData[CurrentBarcodesToAnalyze,'ethnicity'])
+Metadata[,'education'] = as.factor(GeneralData[CurrentBarcodesToAnalyze,'education'])
+Metadata[,'household_income'] = as.factor(GeneralData[CurrentBarcodesToAnalyze,'household_income'])
+Metadata[,'work'] = as.factor(GeneralData[CurrentBarcodesToAnalyze,'work'])
+Metadata[,'Prenatal_alcohol_composite'] = as.factor(GeneralData[CurrentBarcodesToAnalyze,'Prenatal_alcohol_composite'])
+Metadata[,'smokecat_anc'] = as.character(GeneralData[CurrentBarcodesToAnalyze,'smokecat_anc'])
+Metadata[,'preterm'] = as.factor(GeneralData[CurrentBarcodesToAnalyze,'preterm'])
+Metadata[,'Food_insecurity_ANC'] = as.factor(GeneralData[CurrentBarcodesToAnalyze,'Food_insecurity_ANC'])
+Metadata[,'Food_insecurity_14wk'] = as.factor(GeneralData[CurrentBarcodesToAnalyze,'Food_insecurity_14wk'])
+Metadata[,'MaternalDepression'] = as.factor(GeneralData[CurrentBarcodesToAnalyze,'MaternalDepression'])
+Metadata[,'MaternalPTSD'] = as.factor(GeneralData[CurrentBarcodesToAnalyze,'MaternalPTSD'])
+Metadata[,'gestation_delivery'] = GeneralData[CurrentBarcodesToAnalyze,'gestation_delivery']
+Metadata[,'birth_weight'] = GeneralData[CurrentBarcodesToAnalyze,'birth_weight']
+Metadata[,'Prenatal_smoking_composite'] = 
+  as.factor(SmokingAndHouseDensityDataRTI[CurrentBarcodesToAnalyze,'Prenatal_smoking_composite'])
+Metadata[,'number_in_household'] = 
+  as.numeric(SmokingAndHouseDensityDataRTI[CurrentBarcodesToAnalyze,'number_in_household'])
+##------------------------------------------------------------------------------
+
+## This assigns the letter 'B' to individuals in the case group and the letter 'A' to individuals in the control group:
+ArrayOfCaseOrControl = c( rep('B',length(BarcodesOfTestKids)), rep('A',length(BarcodesOfControlKids)), rep('C',length(BarcodesOfNeitherPeople)) )
+Metadata[,'CaseOrControl'] = as.factor(ArrayOfCaseOrControl)
+
+##------------------------------------------------------------------------------
+
+## Now we add batch information and technical variables to the Metadata table:
+Metadata[,'LibraryBatch'] = as.factor(BatchDF[CurrentBarcodesToAnalyze,'Library'])
+Metadata[,'SequencingBatch'] = as.factor(BatchDF[CurrentBarcodesToAnalyze,'Sequencing'])
+Metadata[,'RIN'] = CenteredRINDF[CurrentBarcodesToAnalyze,'RIN']
+NumberOfColumnsBeforeTechnicalVariables = dim(Metadata)[2]
+Metadata = cbind(Metadata, FinalTechnicalMatrix[CurrentBarcodesToAnalyze,])
+
+
+##===============================================================================
+## Standardizing variables so that DESeq2 doesn't get mad (because DESeq2 will spit out a warning if you don't standardize these, as discussed in the previous section about standardizing RIN):
+##==============================================================================
+
+## Standardizing birth weight:
+
+BirthWeightArray = as.numeric(Metadata[,'birth_weight'])
+MeanBirthWeight = mean(BirthWeightArray, na.rm=TRUE)
+CenteredBirthWeightArray = BirthWeightArray - MeanBirthWeight
+#CenteredRINDF$RIN = FinalRINDF$RIN - MeanRIN
+StdBirthWeight = sd(CenteredBirthWeightArray, na.rm=TRUE)
+ScaledBirthWeightArray = CenteredBirthWeightArray/StdBirthWeight
+Metadata[,'birth_weight_standardized'] = ScaledBirthWeightArray
+
+## Standardizing number_in_household:
+
+DensityArray = as.numeric(Metadata[,'number_in_household'])
+MeanDensity = mean(DensityArray, na.rm=TRUE)
+CenteredDensityArray = DensityArray - MeanDensity
+StdDensity = sd(CenteredDensityArray, na.rm=TRUE)
+ScaledDensityArray = CenteredDensityArray/StdDensity
+Metadata[,'number_in_household_standardized'] = ScaledDensityArray
+
+
+## I make a binary household income variable here, which I call household_income_binary:
+Metadata[,'household_income_binary'] = as.character(Metadata[,'household_income'])
+## I group the high income people with the middle income people:
+RichIndices = which(Metadata$household_income == '>R5000/m')
+Metadata[RichIndices, 'household_income_binary'] = 'middle'
+MiddleIndices = which(Metadata$household_income == 'R1000-5000/m')
+Metadata[MiddleIndices, 'household_income_binary'] = 'middle'
+PoorIndices = which(Metadata$household_income == '<R1000/m')
+Metadata[PoorIndices, 'household_income_binary'] = 'poor'
+Metadata[,'household_income_binary'] = as.factor(Metadata[,'household_income_binary'])
+
+## Here I have the ordinal household income variable, and I change the levels to the numbers
+## 1, 2, and 3 rather than the strings that it had before
+## (i.e. changing household income to ordinal numbers):
+Metadata[, 'household_income'] = as.character(Metadata[, 'household_income'])
+Metadata[RichIndices, 'household_income'] = '3'
+Metadata[MiddleIndices, 'household_income'] = '2'
+Metadata[PoorIndices, 'household_income'] = '1'
+Metadata[,'household_income'] = as.numeric(Metadata[,'household_income'])
+
+## Here I have the ordinal education variable, and I change the levels to the numbers
+## 1, 2, and 3 rather than the strings that it had before
+## (i.e. changing education to ordinal numbers):
+Metadata[, 'education'] = as.character(Metadata[, 'education'])
+Metadata[UneducatedIndices, 'education'] = '1'
+SecondIndices = which(Metadata$education == 'some secondary')
+Metadata[SecondIndices, 'education'] = '2'
+ThirdIndices = which(Metadata$education == 'completed secondary')
+Metadata[ThirdIndices, 'education'] = '3'
+Metadata[EducatedIndices, 'education'] = '4'
+Metadata[,'education'] = as.numeric(Metadata[,'education'])
+
+##------------------------------------------------------------------------------
+
+CurrentCountsMatrix = OrderedCountsMatrix[,CurrentBarcodesToAnalyze]
+
+MetadataColumnNames = colnames(Metadata)
+
+## Technical variables are columns 60 to 76 of Metadata, but I will remove a few of them because they are very correlated with other technical variables (i.e. Pearson correlation > 0.8 is the cut off I chose).
+## Hence, here are the indices of the technical variables that I will consider:
+TechnicalVariableIndicesToUse = c(1,2,4,7,8,9,11,12,14:17)
+TechnicalVariables = MetadataColumnNames[(NumberOfColumnsBeforeTechnicalVariables+TechnicalVariableIndicesToUse)]
+
+TVNumbersToNeverExclude = CovariateNumberToNeverExclude
+## This is the Technical Variable numbers to never exclude.
+
+```
+
+
+
+
+
+## Step 1
+In this step, we determine if any covariates are correlated with the outcome (where the outcome is TB progressor vs non progressor, or TB infection vs non-infected, or TB disease vs no disease, or TB infection or disease vs no infection).
+
+```{r}
+if (SectionToRun == 1) {
+
+  source('Step1.R')
+  
+  print('Results for Binary Variables:')
+  print(FractionDF)
+  
+  print('Results for Ordinal Variables (i.e. more than two levels):')
+  print(KendallPValueTable)
+  
+  print('Results for Continuous Covariates:')
+  print(AnovaPValueTable)
+  
+  print('Results for Technical Variables (which are continuous):')
+  print(TTestTableTV)
+
+}
+```
+
+
+
+## Step 2
+This step corrects the counts matrix for sequencing batch and technical variables. Next it uses the corrected counts to perform differential expression analysis (using DESeq2) - it simply uses case vs control in the DESeq2 model and does not include any covariates in the model in this step (the technical variables have been used in counts correction, as I just mentioned, but demographic/clinical covariates are not used in this step). The script performs backwards selection to find the set of technical variables that, when used to correct the counts matrix, results in the most differentially expressed genes (DEGs) for the case vs. control. We then select that set of technical variables (the one that yielded the most DEGs), and we obtain a list of putative DEGs (putative because we do not know yet if they are a result of confounding, which we will control for in steps below.)
+
+```{r}
+if (SectionToRun == 2) {
+
+  if (Step2Option == 1) {
+    source('Step2Fewest.R')
+  } else if (Step2Option == 2) {
+    source('Step2Sameness.R')
+  }
+  print("NSQ Matrix")
+  print(NSQMatrix)
+  
+  print("Record of Removed Covariates")
+  print(RecordOfRemovedCovariates)
+}
+```
+
+
+
+
+
+```{r}
+
+  ## Loading up the corrected counts matrix from the technical variable set that yielded the most DEGs:
+  CorrectedCountsFileToLoad = paste('CorrectedCountsMatrices/', TypeOfBatch, CountsMatrixString, as.character(IndexOfBestTrial), '.RData', sep = "")
+  
+  load(CorrectedCountsFileToLoad)
+
+
+```
+
+## Checking to see if the principal components of expression correlate with any technical covariates and batch. This confirms the counts matrix was successfully corrected for technical covariates and batch.
+
+```{r}
+
+if (SectionToRun == 2 & CorrectionOption == 1) {
+  
+  TechnicalCovariateArray = c(TechnicalVariables, 'RIN')
+  NumberOfCovariates = length(TechnicalCovariateArray)
+  
+  CovariateNumbersUsedInBestTrial = FinalRecordOfRemovedCovariates[IndexOfBestTrial:NumberOfCovariates]
+  CovariatesUsedInBestTrial = TechnicalCovariateArray[CovariateNumbersUsedInBestTrial]
+  
+  if (PlotCountsMatrixOption == 1) {
+    source("customPCA.R")
+    custom.PCA(CorrectedCountsMatrix, rgSet = NULL,
+            Metadata[,c('SequencingBatch','LibraryBatch', CovariatesUsedInBestTrial)],
+           plot.title = 'PCA and Correlations')
+  }
+}
+```
+
+## This determines if the counts matrix was successfully normalized:
+
+```{r}
+if (SectionToRun == 2 & CorrectionOption == 1) {
+
+  SummedCountsArray = colSums(CorrectedCountsMatrix)
+  if (PlotCountsMatrixOption == 1) {
+     plot(SummedCountsArray)
+  }
+  
+}
+```
+
+
+
+## Step 3
+This step determines which covariates are correlated with which RNAs. I do so using the N covariates shown in step (1) to be correlated with the outcome. I run DESeq2 N times, each time including a different one of these covariates in the DESeq2 model (the model contains only that covariate, not the TB outcome). Thus we obtain a list of RNAs that are correlated with each covariate. 
+
+```{r}
+
+if (SectionToRun == 3) {
+  
+  load(FileNameStep2)
+  DESeqResultsFromBackwardsSelection = DEGList[[IndexOfBestTrial]]
+  
+  source('Step3.R')
+  
+}
+
+```
+
+
+
+
+## There is no Step 4
+
+
+
+## Step 5:
+Based on the output of Step 3 I determine which sets of covariates may be confounding each DEG found in step (2). This produces a list of the M confounding covariate sets.
+
+```{r}
+if (SectionToRun == 5) {
+  
+  ## This loads RNACovariateDFLogicals, which shows whether or not each covariate could be a confounder for each RNA:
+  load(FileNameStep3)
+  
+  source('Step5.R')
+  
+  ## This is the confounding covariate sets:
+  print(ConfoundingCovariateSetsDF)
+  
+}
+```
+
+## Step 6:
+Now we run DESeq2 again, this time running it M times, each time with a different confounding covariate set from step (5).
+
+```{r}
+if (SectionToRun == 6) {
+  
+  ## This loads ConfoundingCovariateSetsDF (among other objects, but those other objects aren't important):
+  load(FileNameStep5)
+
+  
+  ## Now we run DESeq2 with the confounding covariate sets:
+  source('Step6.R')
+
+}
+```
+
+
+## Step 7:
+Now we assemble the final DEG list, using the results from step (6), where the p-value for each DEG is from the run of DESeq2 in step (6) that used that DEG's confounding covariate set in the DESeq2 model.
+
+```{r}
+if (SectionToRun == 7) {
+  
+  ## This loads DEGList:
+  load(FileNameStep2)
+  
+  load(FileNameStep3)
+  
+  load(FileNameStep5)
+  
+  ## This loads CaseVsControlResultsList:
+  load(FileNameStep6)
+  
+  source('Step7.R')
+
+  ## This is the final DEG list:
+  print(FinalDEGDF)
+}
+```
+
+## Step 8:
+Using the RNAs found in the final DEG list from step (7), for each of these RNAs, I perform Bayesian logistic regression to determine the relative risk of the outcome (e.g. progression to TB disease) for individuals with the highest expression levels vs individuals with the lowest expression levels.
+
+```{r}
+if (SectionToRun == 8) {
+  
+  ## This for loop takes the covariates that are factors and makes new columns in the metadata   
+  ## where these covariates are treated as numeric values (0 and 1). I use the numeric covariates 
+  ## in some steps below.
+  
+  for (q in which(CovariateClassArray == 0)) {
+    CurrentCovariate = ContrastMatrix[q, 1]
+    NumericCovariateName = paste(CurrentCovariate,'Numeric',sep="")
+    
+    Metadata[, NumericCovariateName] = as.character(Metadata[, CurrentCovariate])
+    HighIndices = which(Metadata[, CurrentCovariate] == ContrastMatrix[q, 2])
+    Metadata[HighIndices, NumericCovariateName] = '1'
+  
+    LowIndices = which(Metadata[, CurrentCovariate] == ContrastMatrix[q, 3])
+    Metadata[LowIndices, NumericCovariateName] = '0'
+    Metadata[, NumericCovariateName] = as.numeric(Metadata[, CurrentCovariate]) - 1
+    ## The "-1" is there because as.numeric makes the values be 1 or 2 instead of 0 or 1.
+  }
+
+
+  ## This loads the FinalDEGDF, MatrixOfConfoundingFinal, AssembledDEGsAndConfoundersMatrix,
+  ## SurvivingDEGNames and NumberOfSurvivingDEGs:
+  load(FileNameStep7)
+
+  source('Step8.R')
+  
+  ## This is the results of logistic regression. Inspect the 95% CIs of the parameters to
+  ## make sure the intervals used in parameter space are small enough to give accurate 
+  ## 95% CIs (i.e. if the top or bottom of the 95% CI is the same as the best value of the 
+  ## parameter, you should make the intervals smaller):
+  print(AllDEGsResultsDF)
+  
+}
+```
+
+
+## Step 9
+Creating Final Tables with DE p-values and Logistic Regression Results:
+
+```{r}
+if (SectionToRun == 9) {
+
+load(FileNameStep7) 
+load(FileNameStep8) 
+  
+##------------------------------------------------------------------------------  
+colnames(AllDEGsResultsDF) = c('Relative Risk Max', 'Bottom of 95% CI', 'Top of 95% CI', 
+                               'Relative Risk 97', 'Bottom of 95% CI', 'Top of 95% CI', 
+                               'Relative Risk 98', 'Bottom of 95% CI', 'Top of 95% CI', 
+                               'Bin Size')
+
+rownames(AllDEGsResultsDF) = SurvivingDEGNames
+
+
+colnames(AllDEGsResultsDFGLM) = c('Log10 OR Max', 'Bottom of 95% CI', 'Top of 95% CI', 
+                                  'Intercept', 'Bottom of 95% CI', 'Top of 95% CI',
+                                  'Beta1', 'Bottom of 95% CI', 'Top of 95% CI',
+                                  'Beta2', 'Bottom of 95% CI', 'Top of 95% CI')
+  
+rownames(AllDEGsResultsDFGLM) = SurvivingDEGNames 
+
+MyEnsIDs = rownames(FinalDEGDF)
+##------------------------------------------------------------------------------  
+  
+  
+## LR stands for Logistic Regression:
+SurvivingDEAndLRTable = cbind(MyEnsIDs,FinalDEGDF,AllDEGsResultsDF, AllDEGsResultsDFGLM[,1:3])
+colnames(SurvivingDEAndLRTable)[1] = "ENSEMBL"
+
+
+library(clusterProfiler)
+MyFullNames = bitr(MyEnsIDs, fromType="ENSEMBL", toType=c("SYMBOL", "GENENAME"), OrgDb="org.Hs.eg.db")
+SurvivingDEAndLRAndNamesTable = merge(SurvivingDEAndLRTable,MyFullNames,by="ENSEMBL",all.x=TRUE)
+
+
+
+##---------------------------------------------------------------------------------------------
+
+RRMaxTable = cbind(SurvivingDEAndLRAndNamesTable[,c(1,21,22)],
+                   SurvivingDEAndLRAndNamesTable[,c(7)],
+                  SurvivingDEAndLRAndNamesTable[,c(8:16)],
+                  SurvivingDEAndLRAndNamesTable[,c(18:20)],
+                  SurvivingDEAndLRAndNamesTable[,c(17)] )
+
+colnames(RRMaxTable) = c('Ensembl','Symbol','Gene Name', 
+                         'padj',
+                         'Computed RRMax', 'Bottom 95% CI', 'Top 95% CI', 
+                         'Computed RR97', 'Bottom 95% CI', 'Top 95% CI',
+                         'Computed RR98', 'Bottom 95% CI', 'Top 95% CI',
+                         'ORMax', 'Bottom 95% CI', 'Top 95% CI', 'BinSize on Log Scale')
+
+
+
+
+
+
+
+TableForPaper = cbind(SurvivingDEAndLRAndNamesTable[, c('ENSEMBL', 'SYMBOL', 'GENENAME', 'pvalue', 'padj','log2FoldChange')],
+                              SurvivingDEAndLRAndNamesTable[, 8:13]   )
+
+colnames(TableForCollaborators) = c('Ensembl ID','Gene Symbol','Gene Name', 
+                                    'P Value', 'Adjusted P Value', 'log2(Fold Change)',
+           'log10(RRmax_vs_min)', 'Bottom of 95% CI for log10(RRmax_vs_min)', 'Top of 95% CI for log10(RRmax_vs_min)',
+           'log10(RR97_vs_3)', 'Bottom of 95% CI for log10(RR97_vs_3)', 'Top of 95% CI for log10(RR97_vs_3)'
+            )
+
+##-------------------------
+## Removing duplicated rows:
+Duplicates = which(duplicated(TableForPaper[,1])==TRUE)
+print("These indices are duplicates:")
+print(Duplicates)
+TableForPaperNoDuplicates = TableForPaper[!duplicated(TableForPaper[,1]),]
+
+##-------------------------
+## Ordering by adjusted p-value:
+OrderedIndices = order(TableForPaperNoDuplicates[,'Adjusted P Value'])
+OrderedTableForCollaborators = TableForPaperNoDuplicates[OrderedIndices, ]
+
+##-------------------------
+## Making the right number of significant figures:
+#options(digits = 2)
+OrderedTableForPaper[,4:5] = signif(OrderedTableForPaper[,4:5],2)
+
+for (q in 6:11) {
+  OrderedTableForPaper[,q] =  formatC(OrderedTableForPaper[,q], digits = 2, format = "fg", flag = "#") 
+}
+##----------------------
+
+CSVFileName = 'TableOfDEResults.csv'
+write.csv(OrderedTableForPaper, CSVFileName, row.names = FALSE)
+
+}
+```
+
+
+
