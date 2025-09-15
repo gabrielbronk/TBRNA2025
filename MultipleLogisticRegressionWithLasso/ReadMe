@@ -1,0 +1,9 @@
+Read Me
+
+This folder performs logistic regression with lasso regularization. It uses transcriptomics from birth to predict whether an individual will be a progressor (symptomatic) or non-progressor (asymptomatic) if they become infected with mycobacterium tuberculosis. The scripts can also be used to predict other case vs. control categories (infected vs. non-infected, or progressor vs, everyone else).
+
+To run the logistic regression with lasso regularization, start with “MultipleLogisticRegressionWithLasso.Rmd”, first making sure to set your desired options in "OptionsForMultipleLogisticRegression.R".
+
+If you run “MultipleLogisticRegressionWithLasso.Rmd” using parallel jobs, you will next need to run “CombiningOutputFilesFromMultipleLogisticRegression.Rmd” to combine the outputs of the parallel jobs into a single file. If you didn’t use parallel jobs, you can skip this.
+
+Finally, you will run “MultipleLogisticRegressionPerformanceEvaluation.Rmd”, which will tell you how well the model performed or the coefficients of the model.
