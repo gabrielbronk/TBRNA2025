@@ -1,0 +1,3 @@
+Read Me for the DifferentialExpressionAnalysisPipeline folder
+
+To run our differential expression analysis methodology, run the script DifferentialExpressionAnalysisPipelineMainScript.Rmd (first read the text at the beginning of the script).
