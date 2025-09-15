@@ -1,0 +1,129 @@
+---
+title: "Combining Output Files from Multiple Logistic Regression"
+author: "Gabriel Bronk, PhD"
+date: "2025-06-12"
+output: html_document
+---
+
+## This script combines the tensors and lists from all parallel jobs so that they are all part 
+## of the same tensors and lists. It then saves these combined tensors and lists into an .RData
+## file with the same name as the .RData files from the individual parallel jobs, but the combined
+## file has "Combined" at the end of the file name.
+
+## This script will take around 10 minutes to run on a laptop.
+
+##===================================================================================================
+## IMPORTANT: Choose your directory here, and open "OptionsForMultipleLogisticRegression.R" to select the options you want to use:
+##===================================================================================================
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## Write your directory name here:
+MyDirectory = 'c:/Users/gbron/OneDrive - Mass General Brigham/Documents/AKlengelLab/R01Project/GitHubForTB/Data'
+
+knitr::opts_knit$set(root.dir = MyDirectory)
+```
+
+```{r}
+source('../OptionsForMultipleLogisticRegression.R')
+```
+
+
+
+
+```{r}
+
+##==============================================================================
+## Initializing Tensors and Lists for All Folds of Outer Cross Validation:
+##==============================================================================
+## The tensors will be initialized by filling them entirely with -1:
+MinusOnes = rep(-1, NumberOfLambdas * NumberOfUs * kOCV * NumberOfCutOffs)
+
+## In the names of the tensors below, the lowercase c stands for "combined."
+
+## TOC stands for Tensor for Outer Cross validation:
+MeanAccuracyTOCc = array(MinusOnes,
+                        c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+
+MeanSensitivityTOCc = array(MinusOnes,
+                           c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+
+MeanSpecificityTOCc = array(MinusOnes,
+                           c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+
+MeanF1TOCc = array(MinusOnes,
+                  c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+
+MeanAUCTOCc = array(MinusOnes,
+                    c(NumberOfLambdas, NumberOfUs, kOCV))
+
+MeanPPVTOCc = array(MinusOnes,
+                   c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+
+MeanNPVTOCc = array(MinusOnes,
+                   c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+
+CountMatrixListc = list()
+InputRNANamesOrderedListc = list()
+
+
+##==============================================================================
+## Combining Matrices and Lists from Different Folds of Cross Validation:
+#===============================================================================
+
+for (ParallelJob in 1:TotalNumberOfJobs) {
+  
+  FileNameToLoad = paste(NameOfOutputFile, as.character(ParallelJob), '.RData', sep="")
+  load(FileNameToLoad)
+  
+  OCVsRunInThisParallelJob = ((ParallelJob-1)*NumberOfOCVsPerJob + 1):((ParallelJob)*NumberOfOCVsPerJob)
+  
+  MeanAccuracyTOCc[, , OCVsRunInThisParallelJob, ] = MeanAccuracyTOC[, , OCVsRunInThisParallelJob, ]
+  
+  MeanSensitivityTOCc[, , OCVsRunInThisParallelJob, ] = MeanSensitivityTOC[, , OCVsRunInThisParallelJob, ]
+ 
+  MeanSpecificityTOCc[, , OCVsRunInThisParallelJob, ] = MeanSpecificityTOC[, , OCVsRunInThisParallelJob, ]
+  
+  MeanF1TOCc[, , OCVsRunInThisParallelJob, ] = MeanF1TOC[, , OCVsRunInThisParallelJob, ]
+ 
+  MeanAUCTOCc[, , OCVsRunInThisParallelJob] = MeanAUCTOC[, , OCVsRunInThisParallelJob]
+  
+  MeanPPVTOCc[, , OCVsRunInThisParallelJob, ] = MeanPPVTOC[, , OCVsRunInThisParallelJob, ]
+  
+  MeanNPVTOCc[, , OCVsRunInThisParallelJob, ] = MeanNPVTOC[, , OCVsRunInThisParallelJob, ]
+ 
+  CountMatrixListc[OCVsRunInThisParallelJob] = CountMatrixList[OCVsRunInThisParallelJob]
+  InputRNANamesOrderedListc[OCVsRunInThisParallelJob] = InputRNANamesOrderedList[OCVsRunInThisParallelJob]
+  
+}
+
+
+##==============================================================================
+## Renaming the tensors and lists, and saving them to a file:
+##==============================================================================
+
+MeanAccuracyTOC = MeanAccuracyTOCc
+MeanSensitivityTOC = MeanSensitivityTOCc
+MeanSpecificityTOC = MeanSpecificityTOCc
+MeanF1TOC = MeanF1TOCc
+MeanAUCTOC = MeanAUCTOCc
+MeanPPVTOC = MeanPPVTOCc
+MeanNPVTOC = MeanNPVTOCc
+
+CountMatrixList = CountMatrixListc
+InputRNANamesOrderedList = InputRNANamesOrderedListc
+
+FileNameToSave = paste(NameOfOutputFile, 'Combined.RData', sep="")
+  
+save(CountMatrixList, FinalResponseVector, SubsetIndices,
+     InputRNANamesOrderedList,
+     ReorderingIndices, EvenlyReorderedBarcodes, MySeed,
+     MeanF1TOC, MeanAccuracyTOC, 
+     MeanSensitivityTOC, MeanSpecificityTOC, 
+     MeanPPVTOC, MeanNPVTOC, MeanAUCTOC, 
+     file = FileNameToSave)
+
+```
+
+

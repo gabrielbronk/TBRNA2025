@@ -1,0 +1,1125 @@
+---
+title: "Multiple Logistic Regression with Lasso for TB"
+author: "Gabriel Bronk, PhD"
+date: "2025-08-01"
+output: html_document
+---
+
+This script performs logistic regression with lasso regularization. It uses
+transcriptomics from birth to predict whether an individual will be a progressor (symptomatic) or
+non-progressor (asymptomatic) if they become infected with mycobacterium tuberculosis. The script
+also can predict other case vs control categories (infected vs non-infected, or progressor vs everyone else). The process involves using DESeq2 to find the top differentially expressed RNAs, which get input
+into the lasso regularization. This is done in a nested cross validation fashion, ensuring no data leakage
+from the test data or validation data to the training data.
+
+An important aspect of this script is the correction of the counts matrix for batch and technical variables. I have found that this makes a difference in terms of performance of the progressor vs non-progressor prediction (the AUC is lower if the counts are not corrected for technical variables). This counts correction is performed in every inner and outer cross validation fold. We corrected for sequencing batch as well as intergenic rate (from the MultiQC tool) and exonic rate (from the MultiQC tool), which are the technical variables that affect the most RNAs in the count matrix (i.e. DESeq2 found the most RNAs correlate with these technical variables at a nominal p-value threshold of 0.05).
+
+This script takes several days to run on a computer cluster, or you can launch it as a parallel job array
+so that it will take less than a day.
+
+##===================================================================================================
+## IMPORTANT: Choose your directory here, and open "OptionsForMultipleLogisticRegression.R" to select the options you want to use:
+##===================================================================================================
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## Write your directory name here:
+MyDirectory = 'c:/Users/gbron/OneDrive - Mass General Brigham/Documents/AKlengelLab/R01Project/GitHubForTB/Data'
+
+knitr::opts_knit$set(root.dir = MyDirectory)
+```
+
+
+
+
+
+
+
+##==============================================================================
+##==============================================================================
+## NO MORE INPUTS ARE NEEDED BEYOND THIS POINT
+## (i.e. you do not need to modify the code below here).
+##==============================================================================
+##==============================================================================
+
+
+
+
+
+
+
+```{r}
+source('../MultipleLogisticRegressionWithLasso/OptionsForMultipleLogisticRegression.R')
+```
+
+## Loading R packages:
+
+```{r}
+
+library(DESeq2)
+library(readxl)
+library(pROC)
+library(glmnet)
+library(matrixStats)
+
+```
+
+
+## This section loads data and sets up the rest of the script:
+
+```{r}
+
+##------------------------------------------------------------------------------
+## This section determines which fold of nested cross validation should be run in the current parallel job, if running parallel jobs:
+##------------------------------------------------------------------------------
+
+if (JobArrayOption == 0) {
+  TaskID = 1
+} else if (JobArrayOption == 1) {
+  TaskID = Sys.getenv("SLURM_ARRAY_TASK_ID")
+}
+
+TaskIDNumber = as.integer(TaskID)
+
+CurrentParallelJob = TaskIDNumber %% TotalNumberOfJobs
+if (CurrentParallelJob == 0) {
+  CurrentParallelJob = TotalNumberOfJobs
+}
+
+FullNameOfOutputFile = paste(NameOfOutputFile, as.character(CurrentParallelJob), '.RData', sep="")
+
+if (CrossValidationOption == 1) {
+  OCVsToRunInThisParallelJob = 
+    ((CurrentParallelJob-1)*NumberOfOCVsPerJob + 1):((CurrentParallelJob)*NumberOfOCVsPerJob)
+} else if (CrossValidationOption == 2) {
+  OCVsToRunInThisParallelJob = 1
+}
+
+
+##------------------------------------------------------------------------------  
+## Creating the DESeq2 contrast and the design formula with technical variables:  
+##------------------------------------------------------------------------------  
+
+if (AnalysisOption == 1 | AnalysisOption == 3) {
+## These are the technical variables we use in our TB disease vs. Mtb-infected non-progressor prediction, and in our TB disease vs. no disease prediction:
+  MyDesignFormula = as.formula("~ SequencingBatch + ExonicRate + IntergenicRate + FivePrimeTo3PrimeBias")
+  CovariateArray = c('SequencingBatch', 'ExonicRate', 'IntergenicRate', 'FivePrimeTo3PrimeBias')
+
+} else if  (AnalysisOption == 2) {
+## These are the technical variables we use in our Mtb-infected vs. non-infected prediction:
+  MyDesignFormula = 
+  as.formula("~ SequencingBatch + ExonicRate + IntergenicRate + PercentMapped + DuplicationRateOfMapped")
+  CovariateArray =
+  c('SequencingBatch', 'ExonicRate', 'IntergenicRate', 'PercentMapped', 'DuplicationRateOfMapped')
+}
+
+NumberOfTechnicalVariablesBB = length(CovariateArray) - 1
+## This is the number of technical covariates not counting sequencing batch. BB stands for "Besides Batch"
+
+ContrastVariables = c("CaseOrControl",'B','A') 
+## These are the groups that will be compared in DESeq2. 
+## Because A is written last, A is the reference, so if we see an increase in 
+## expression, it means that B is expressed more than A.
+MyReferenceLevel = 'A'  
+
+
+##------------------------------------------------------------------------------
+## Regarding 95% CIs:
+##------------------------------------------------------------------------------
+
+NumberOfBootstrapTrials = 1000
+## We perform bootstrapping to determing the 95% confidence intervals for the machine learning model's accuracy, sensitivity, specificity, etc. This is the number of simulation trials in the bootstrapping procedure.
+
+
+##------------------------------------------------------------------------------
+## Loading the Count Matrix:
+##------------------------------------------------------------------------------
+
+LoadedCountMatrix = read.csv("RawCountMatrix.csv", header = FALSE)
+
+## Reformatting the count matrix:
+LoadedCountMatrixWithHeaders = LoadedCountMatrix[-1,]
+colnames(LoadedCountMatrixWithHeaders) = LoadedCountMatrix[1,]
+RawCountMatrix = LoadedCountMatrixWithHeaders[,-1]
+rownames(RawCountMatrix) = LoadedCountMatrixWithHeaders[,1]
+
+
+##------------------------------------------------------------------------------
+## Loading the Technical Covariates:
+##------------------------------------------------------------------------------
+
+## Here we load the values of the technical covariates. DF stands for Data Frame:
+RinDF = read.csv("RNAIntegrityNumbers.csv", header = TRUE)
+TechnicalDF = as.data.frame(read_excel('TechnicalCovariatesFromMultiQC.xlsx'))
+BatchDF = read.csv('Batches.csv')   
+rownames(BatchDF) = BatchDF[,1]
+BatchDF = BatchDF[,-1]
+
+## This section centers the RIN values because DESeq2 puts out a warning if you do not center them. 
+rownames(RinDF) = RinDF$Barcode
+RinDF$RIN = as.numeric(RinDF$RIN)
+MeanRIN = mean(RinDF$RIN)
+CenteredRINDF = RinDF
+CenteredRINDF$RIN = RinDF$RIN - MeanRIN
+
+## To avoid DESeq2 putting out a warning, we center and scale every technical covariate from the MultiQC tool:
+rownames(TechnicalDF) = TechnicalDF$Barcode
+## Column 20 is removed because the Average Read Lengths in column 20 are not correct:
+TechnicalDFReformatted = TechnicalDF[,-c(1,20)]
+FinalTechnicalDF = TechnicalDFReformatted
+NumberOfTechnicalVariables = dim(TechnicalDFReformatted)[2]
+## CN stands for Column Number:
+for (CN in 1:NumberOfTechnicalVariables){
+  ColumnMean = mean(TechnicalDFReformatted[,CN])
+  ColumnStdDev = sd(TechnicalDFReformatted[,CN])
+  FinalTechnicalDF[,CN] = ( TechnicalDFReformatted[,CN] - ColumnMean )/ColumnStdDev 
+}  
+
+
+##------------------------------------------------------------------------------
+## Loading the Barcodes that Correspond to Individuals:
+##------------------------------------------------------------------------------
+
+AllBarcodes = TechnicalDF$Barcode
+
+## This loads the barcodes of the individuals in in each outcome group. The outcome groups are:
+## -AINoIsoniazid, which is individuals who had positive tuberculin skin tests but did not progress to TB disease AND did not receive isoniazid. (AI stands for Asymptomatic Infected).
+## -NonInfected, which is individuals who did not have positive tuberculin skin tests.
+## -TB, which is individuals who contracted TB
+## -NonDisease, which is comprised of the AINoIsoniazid and NonInfected groups
+## -InfectedOrTB, which is individuals who had positive tuberculin skin tests and/or contracted TB disease. 
+load('BarcodesOfOutcomeGroups.RData')
+
+if (AnalysisOption == 1) {
+  BarcodesOfTestKids = BarcodesOfTB 
+  BarcodesOfControlKids = BarcodesOfAINoIsoniazid 
+} else if (AnalysisOption == 2) {
+  BarcodesOfTestKids = BarcodesOfTB 
+  BarcodesOfControlKids = BarcodesOfNonDisease
+} else if (AnalysisOption == 3) {
+  BarcodesOfTestKids = BarcodesOfInfectedOrTB
+  BarcodesOfControlKids = BarcodesOfNonInfected
+}
+
+NumberOfTestKids = length(BarcodesOfTestKids)
+NumberOfControlKids = length(BarcodesOfControlKids)
+NumberOfKidsOfInterest = NumberOfTestKids + NumberOfControlKids 
+
+## In correcting for technical variables, We use all 1815 samples - i.e. not just cord blood samples but also peripheral blood at later ages and from other individuals. Because these samples were all sequenced simultaneously, it helps us to control for the technical variables of sequencing. All the samples that are not the cord blood samples from test kids or the control kids are referred to as the BarcodesOfOtherSamples.
+LogicalsOfOtherSamples = AllBarcodes %in% c(BarcodesOfTestKids,BarcodesOfControlKids)
+IndicesOfOtherSamples = which(LogicalsOfOtherSamples == FALSE)
+BarcodesOfOtherSamples = AllBarcodes[IndicesOfOtherSamples]
+CurrentBarcodesToAnalyze = c(BarcodesOfTestKids,BarcodesOfControlKids,BarcodesOfOtherSamples)
+
+
+##------------------------------------------------------------------------------
+## Creating the Metadata Table:
+##------------------------------------------------------------------------------
+Metadata = data.frame('ExtractionBatch' =
+                        as.factor(BatchDF[CurrentBarcodesToAnalyze,'Extraction']))
+rownames(Metadata) = CurrentBarcodesToAnalyze
+Metadata[,'LibraryBatch'] = as.factor(BatchDF[CurrentBarcodesToAnalyze,'Library'])
+Metadata[,'SequencingBatch'] = as.factor(BatchDF[CurrentBarcodesToAnalyze,'Sequencing'])
+Metadata[,'RIN'] = CenteredRINDF[CurrentBarcodesToAnalyze,'RIN']
+Metadata = cbind(Metadata, FinalTechnicalDF[CurrentBarcodesToAnalyze,])
+
+ArrayOfCaseOrControl = c( rep('B',length(BarcodesOfTestKids)), rep('A',length(BarcodesOfControlKids)), rep('C',length(BarcodesOfOtherSamples)) )
+Metadata[,'CaseOrControl'] = as.factor(ArrayOfCaseOrControl)
+
+
+```
+
+
+## Normalizing the Count Matrix:
+
+```{r}
+
+## Here we normalize the counts matrix. Note that FinalTechnicalMatrix has no role in this normalization.
+## It's simply there as a place holder (because DESeq2 requires there to be an input for colData),
+## and FinalTechnicalMatrix has the order of barcodes the same as RawCountsMatrix, which I believe
+## is necessary.
+ddsForNormalization = DESeqDataSetFromMatrix(countData = RawCountMatrix,
+                                             colData = FinalTechnicalDF,
+                                             design = ~ 1)
+ddsForNormalization <- estimateSizeFactors(ddsForNormalization)
+NormalizedCountsMatrix = counts(ddsForNormalization, normalized = TRUE)
+MySizeFactorsAll = sizeFactors(ddsForNormalization)
+
+## This will filter out the low counts RNAs:
+filter = rowSums(NormalizedCountsMatrix >= 10) >= 4
+
+```
+
+
+## Sample redistribution section:
+## The following sections distribute the samples among cross validation folds 
+## so that every fold of outer cross validation has roughly the same number of 
+## individuals from the case and control groups.
+
+```{r}
+
+##------------------------------------------------------------------------------
+##------------------------------------------------------------------------------
+## The first steps before we can divide individuals among cross validation folds:
+##------------------------------------------------------------------------------
+##------------------------------------------------------------------------------
+
+SubsetIndices = list()
+
+## For outer cross-validation:
+SubsetSize = round(NumberOfKidsOfInterest/kOCV) 
+## (SubsetSize is the number of individuals to include in each testing set in outer cross validation).
+SubsetBoundaryIndices = c(seq(1, NumberOfKidsOfInterest, by=SubsetSize), (NumberOfKidsOfInterest+1))
+for (o in 1:kOCV) {
+  SubsetIndices[[o]] = SubsetBoundaryIndices[o]:(SubsetBoundaryIndices[o+1]-1)
+}
+## (SubsetIndices allows the individuals to be split into training and testing sets, 
+## as you'll see later in this code chunk).
+
+if (CrossValidationOption == 2) {
+  SubsetSize = 0
+}
+
+## For inner cross-validation:
+## IL stands for Inner cross-validation Loop:
+NumOfPeopleForIL = NumberOfKidsOfInterest - SubsetSize
+SubsetSizeForIL = round(NumOfPeopleForIL/kin)
+SubsetBoundaryIndicesForIL = c(seq(1, NumOfPeopleForIL, by=SubsetSizeForIL), (NumOfPeopleForIL+1))
+SubsetIndicesForIL = list()
+for (r in 1:kin) {
+  SubsetIndicesForIL[[r]] = SubsetBoundaryIndicesForIL[r]:(SubsetBoundaryIndicesForIL[r+1]-1)
+}
+
+
+
+##------------------------------------------------------------------------------
+##------------------------------------------------------------------------------
+## Next we distribute individuals to different folds of outer cross validation. 
+## Each section below corresponds to a different analysis. 
+##------------------------------------------------------------------------------
+##------------------------------------------------------------------------------
+
+
+
+##------------------------------------------------------------------------------
+##------------------------------------------------------------------------------
+## This is for TB progressors vs Mtb-infected non-progressors:
+##------------------------------------------------------------------------------
+##------------------------------------------------------------------------------
+
+if (AnalysisOption == 1) {
+
+NumberOfGroups = 2
+## There are 2 groups that will be distributed across folds of outer cross validation: TB disease, and Mtb-infected non-progressors.
+  
+## Ideally, for each group, every fold of outer cross validation would have the same number of individuals from that group. However, it may not be possible to have exactly the same number for each fold. Therefore, for each group, there is a mean number of individuals from that group in each fold, and here I define the maximum deviation from the mean allowed in each fold:  
+MaximumDeviation = c(1,2)
+
+BarcodesGroup1 = BarcodesOfTestKids
+BarcodesGroup2 = BarcodesOfControlKids
+
+NumberOfGroup1 = length(BarcodesGroup1)
+NumberOfGroup2 = length(BarcodesGroup2)
+
+BarcodesToReorder = c(BarcodesGroup1, BarcodesGroup2)
+ResponseVector = c(rep(1,NumberOfTestKids), rep(0,NumberOfControlKids))
+## FE stands for "For Evaluating" whether the groups have been evenly distributed:
+ResponseVectorFE = c(rep(1,NumberOfGroup1), rep(2,NumberOfGroup2))
+
+NumberForRandomSeed = 1
+MySeed = NumberForRandomSeed*10^7 
+
+TryAgain = 1
+while (TryAgain == 1) {
+  TryAgain = 0
+  MySeed = MySeed + 1
+  set.seed(MySeed)
+
+  ## BarcodesToReorder is an array containing the barcodes of the children we are interested in. 
+  ## Now we randomly reorder the children, and we see whether this results in the children from each group
+  ## being roughly evenly spread across the folds of outer cross validation. If it doesn't result in a
+  ## roughly even spread, the while loop will continue and will keep trying other random reorderings of 
+  ## the children until it succeeds.
+  ReorderingIndices = sample(1:NumberOfKidsOfInterest)
+  EvenlyReorderedBarcodes = BarcodesToReorder[ReorderingIndices]
+  FinalResponseVector = ResponseVector[ReorderingIndices]
+  FinalResponseVectorFE = ResponseVectorFE[ReorderingIndices]
+
+  GroupMatrix = matrix(0, NumberOfGroups, kOCV)
+  for (O in 1:kOCV) {
+    CurrentFoldResponses = FinalResponseVectorFE[SubsetIndices[[O]]]
+    for (I in 1:NumberOfGroups) {
+      GroupMatrix[I, O] = length(which(CurrentFoldResponses == I))
+    }
+  }
+
+  DeviationMatrix = abs(GroupMatrix - rowMeans(GroupMatrix))
+  for (I in 1:NumberOfGroups) {
+    NumberOfDeviants = length(which(DeviationMatrix[I,] > MaximumDeviation[I]))
+    if (NumberOfDeviants > 0){
+      TryAgain = 1
+    }
+  }
+
+}
+print('The Random Seed is')
+print(MySeed)
+
+}
+
+
+
+##------------------------------------------------------------------------------
+##------------------------------------------------------------------------------
+## This is for TB Disease vs. No Disease (both Mtb-infected non-progressors and non-infected):
+##------------------------------------------------------------------------------
+##------------------------------------------------------------------------------
+
+if (AnalysisOption == 2) {
+
+NumberOfGroups = 3  
+## There are 3 groups that will be distributed across folds of outer cross validation: TB disease, Mtb-infected non-progressors, and non-infected.
+  
+## Ideally, for each group, every fold of outer cross validation would have the same number of individuals from that group. However, it may not be possible to have exactly the same number for each fold. Therefore, for each group, there is a mean number of individuals from that group in each fold, and here I define the maximum deviation from the mean allowed in each fold:
+MaximumDeviation = c(2,2,15)
+
+BarcodesGroup1 = BarcodesOfTB
+BarcodesGroup2 = BarcodesOfAINoIsoniazid
+BarcodesGroup3 = BarcodesOfNonInfected
+
+NumberOfGroup1 = length(BarcodesGroup1)
+NumberOfGroup2 = length(BarcodesGroup2)
+NumberOfGroup3 = length(BarcodesGroup3)
+
+BarcodesToReorder = c(BarcodesGroup1, BarcodesGroup2, BarcodesGroup3)
+ResponseVector = c(rep(1,NumberOfTestKids), rep(0,NumberOfControlKids))
+## FE stands for "For Evaluating" whether the groups have been evenly distributed:
+ResponseVectorFE = c(rep(1,NumberOfGroup1), rep(2,NumberOfGroup2), rep(3,NumberOfGroup3))
+
+NumberForRandomSeed = 1
+MySeed = (NumberForRandomSeed-1)*10^7 
+
+TryAgain = 1
+while (TryAgain == 1) {
+  TryAgain = 0
+  MySeed = MySeed + 1
+  set.seed(MySeed)
+
+  ## BarcodesToReorder is an array containing the barcodes of the children we are interested in. 
+  ## Now we randomly reorder the children, and we see whether this results in the children from each group
+  ## being roughly evenly spread across the folds of outer cross validation. If it doesn't result in a
+  ## roughly even spread, the while loop will continue and will keep trying other random reorderings of 
+  ## the children until it succeeds.
+  ReorderingIndices = sample(1:NumberOfKidsOfInterest)
+  EvenlyReorderedBarcodes = BarcodesToReorder[ReorderingIndices]
+  FinalResponseVector = ResponseVector[ReorderingIndices]
+  FinalResponseVectorFE = ResponseVectorFE[ReorderingIndices]
+  
+  GroupMatrix = matrix(0, NumberOfGroups, kOCV)
+  for (O in 1:kOCV) {
+    CurrentFoldResponses = FinalResponseVectorFE[SubsetIndices[[O]]]
+    for (I in 1:NumberOfGroups) {
+      GroupMatrix[I, O] = length(which(CurrentFoldResponses == I))
+    }
+  }
+  
+  DeviationMatrix = abs(GroupMatrix - rowMeans(GroupMatrix))
+  for (I in 1:NumberOfGroups) {
+    NumberOfDeviants = length(which(DeviationMatrix[I,] > MaximumDeviation[I]))
+    if (NumberOfDeviants > 0){
+      TryAgain = 1
+    }
+  }
+  
+}
+print('The Random Seed is')
+print(MySeed)
+
+}
+
+
+
+##------------------------------------------------------------------------------
+##------------------------------------------------------------------------------
+## This is for Infected (TB disease or Mtb-infected non-progressors) vs. non-infected:
+##------------------------------------------------------------------------------
+##------------------------------------------------------------------------------
+
+if (AnalysisOption == 3) {
+
+NumberOfGroups = 3  
+## There are 3 groups that will be distributed across folds of outer cross validation: TB disease, Mtb-infected non-progressors, and non-infected.
+  
+## Ideally, for each group, every fold of outer cross validation would have the same number of individuals from that group. However, it may not be possible to have exactly the same number for each fold. Therefore, for each group, there is a mean number of individuals from that group in each fold, and here I define the maximum deviation from the mean allowed in each fold:
+MaximumDeviation = c(2,2,15)
+
+Logicals = BarcodesOfInfectedOrTB %in% BarcodesOfTB
+Indices = which(Logicals == FALSE)
+BarcodesOfInfectedNonTB = BarcodesOfInfectedOrTB[Indices]
+
+
+BarcodesGroup1 = BarcodesOfTB
+BarcodesGroup2 = BarcodesOfInfectedNonTB
+BarcodesGroup3 = BarcodesOfNonInfected
+
+NumberOfGroup1 = length(BarcodesGroup1)
+NumberOfGroup2 = length(BarcodesGroup2)
+NumberOfGroup3 = length(BarcodesGroup3)
+
+BarcodesToReorder = c(BarcodesGroup1, BarcodesGroup2, BarcodesGroup3)
+ResponseVector = c(rep(1,NumberOfTestKids), rep(0,NumberOfControlKids))
+## FE stands for "For Evaluating" whether the groups have been evenly distributed:
+ResponseVectorFE = c(rep(1,NumberOfGroup1), rep(2,NumberOfGroup2), rep(3,NumberOfGroup3))
+
+NumberForRandomSeed = 1
+MySeed = (NumberForRandomSeed-1)*10^7 
+
+TryAgain = 1
+while (TryAgain == 1) {
+  TryAgain = 0
+  MySeed = MySeed + 1
+  set.seed(MySeed)
+
+  ## BarcodesToReorder is an array containing the barcodes of the children we are interested in. 
+  ## Now we randomly reorder the children, and we see whether this results in the children from each group
+  ## being roughly evenly spread across the folds of outer cross validation. If it doesn't result in a
+  ## roughly even spread, the while loop will continue and will keep trying other random reorderings of 
+  ## the children until it succeeds.
+  ReorderingIndices = sample(1:NumberOfKidsOfInterest)
+  EvenlyReorderedBarcodes = BarcodesToReorder[ReorderingIndices]
+  FinalResponseVector = ResponseVector[ReorderingIndices]
+  FinalResponseVectorFE = ResponseVectorFE[ReorderingIndices]
+  
+  GroupMatrix = matrix(0, NumberOfGroups, kOCV)
+  for (O in 1:kOCV) {
+    CurrentFoldResponses = FinalResponseVectorFE[SubsetIndices[[O]]]
+    for (I in 1:NumberOfGroups) {
+      GroupMatrix[I, O] = length(which(CurrentFoldResponses == I))
+    }
+  }
+  
+  DeviationMatrix = abs(GroupMatrix - rowMeans(GroupMatrix))
+  for (I in 1:NumberOfGroups) {
+    NumberOfDeviants = length(which(DeviationMatrix[I,] > MaximumDeviation[I]))
+    if (NumberOfDeviants > 0){
+      TryAgain = 1
+    }
+  }
+  
+}
+print('The Random Seed is')
+print(MySeed)
+
+}
+```
+
+
+## Initializing Tensors for All Folds of Outer Cross Validation::
+
+```{r}
+
+## The tensors will be initialized by filling them entirely with -1:
+MinusOnes = rep(-1, NumberOfLambdas * NumberOfUs * kOCV * NumberOfCutOffs)
+
+## TOC stands for Tensor for Outer Cross validation:
+MeanAccuracyTOC = array(MinusOnes,
+                        c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+## The MeanAccuracyTOC will store the values of the accuracy of the machine learning model for each hyperparameter set. Specifically, it will store the mean accuracy of the inner cross validation loop for the kth fold of outer cross validation. Similarly. StdAccuracyTOC will store the standard deviation of the accuracy of the inner cross validation loop for the kth fold of outer cross validation. Similarly, the other TOCs below store the values of other performance metrics such as sensitivity and specificity.
+
+MeanSensitivityTOC = array(MinusOnes,
+                           c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+
+MeanSpecificityTOC = array(MinusOnes,
+                           c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+
+## This is for the F1 score:
+MeanF1TOC = array(MinusOnes,
+                  c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+
+MeanAUCTOC = array(MinusOnes,
+                   c(NumberOfLambdas, NumberOfUs, kOCV))
+
+
+## This is for the Positive Predictive Value:
+MeanPPVTOC = array(MinusOnes,
+                   c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+
+
+## This is for the Negative Predictive Value:
+MeanNPVTOC = array(MinusOnes,
+                   c(NumberOfLambdas, NumberOfUs, kOCV, NumberOfCutOffs))
+
+
+InputRNANamesOrderedList = list()
+CountMatrixList = list()
+
+```
+
+
+
+
+## Executing the Nested Cross Validation:
+## (If not familiar with nested cross validation, make sure to read about it).
+
+```{r}
+
+##==============================================================================
+## The Outer Cross Validation Loop begins here.
+## This runs through all folds of outer cross validation 
+## (o is the fold of outer cross validation):
+##==============================================================================
+
+for (o in OCVsToRunInThisParallelJob){  
+  
+  print("Current Outer Cross Validation Fold:")
+  print(o)
+
+  ##============================================================================
+  ## Defining the Samples that We Will Use in this Fold of Outer Cross Validation
+  ##============================================================================
+  
+  ## Here we use the SubsetIndices to divide the the count matrix and response 
+  ## vector into testing and non-testing count matrices and response vectors. 
+  ## Non-testing means that it will be further divided into training and validation 
+  ## sets when we get to the inner cross validation.
+  
+  ## Defining Barcodes:
+  TestingBarcodes = EvenlyReorderedBarcodes[SubsetIndices[[o]]]
+  NonTestingBarcodes = EvenlyReorderedBarcodes[ -SubsetIndices[[o]] ]
+  if (CrossValidationOption == 2) {
+    TestingBarcodes = c()
+    NonTestingBarcodes = EvenlyReorderedBarcodes
+  }
+  
+  NonTestingAndOtherBarcodes = c(NonTestingBarcodes, BarcodesOfOtherSamples)
+  NonTestingAndOtherAndTestingBarcodes = c(NonTestingBarcodes, BarcodesOfOtherSamples, TestingBarcodes)
+  
+  ## Defining Uncorrected Count (UC) Matrices 
+  ## (uncorrected means it has not yet been corrected for technical variables):
+  NonTestingAndOtherUCMatrix = RawCountMatrix[filter, NonTestingAndOtherBarcodes] 
+  ForCorrectionUCMatrix = NormalizedCountsMatrix[filter, c(NonTestingBarcodes, TestingBarcodes)] 
+  
+  ## Defining Metadata:
+  NonTestingAndOtherMetadata = Metadata[NonTestingAndOtherBarcodes,] 
+  ForCorrectionMetadata = Metadata[c(NonTestingBarcodes, TestingBarcodes), CovariateArray]
+  
+  ## Defining Response Vectors:
+  TestingResponseVector = FinalResponseVector[SubsetIndices[[o]]]
+  NonTestingResponseVector = FinalResponseVector[-SubsetIndices[[o]]]
+  if (CrossValidationOption == 2) {
+    TestingResponseVector = c()
+    NonTestingResponseVector = FinalResponseVector
+  }
+  
+  NumberOfNonTestingKids = length(NonTestingResponseVector)
+  NumberOfTestingKids = length(TestingResponseVector)
+  
+  
+  ##==============================================================================
+  ## Running DESeq2 Differential Expression Analysis for Technical Variables 
+  ## so that we can obtain the coefficients for the technical variables
+  ## that allow us to correct the counts for the technical variables:
+  ##==============================================================================
+  
+  ## Running functions from DESeq2:
+  dds = DESeqDataSetFromMatrix(countData = NonTestingAndOtherUCMatrix, 
+                               colData = NonTestingAndOtherMetadata, 
+                               design = MyDesignFormula)   
+  
+  dds = DESeq(dds)
+  ddsOriginal = dds
+  CorrectionConvergenceFilter = which(mcols(dds)$betaConv)
+  dds = dds[CorrectionConvergenceFilter,]
+  
+  CoefficientMatrix = coef(dds)
+  
+  
+  ##==============================================================================
+  ## Correcting the Count Matrix:
+  ##==============================================================================
+  
+  ## This is the number of RNAs after removal of low count RNAs and 
+  ## RNAs whose coefficients did not converge:
+  NumberOfAllRNAsPresently = dim(CoefficientMatrix)[1] 
+
+  ## ConvergenceFilter is the RNAs that converged during the DESeq2 analysis of 
+  ## all the non-testing and other samples used for batch and technical variable 
+  ## information. For any RNAs that did not converge, we can't determine coefficients, 
+  ## so we can't correct that RNA's counts. Thus we get rid of those RNAs by applying 
+  ## the filter to the ForCorrectionUCMatrix:
+  ForCorrectionUCMatrixConverged = ForCorrectionUCMatrix[CorrectionConvergenceFilter,] 
+  NewCountMatrix = ForCorrectionUCMatrixConverged
+  
+  MetadataFCC = ForCorrectionMetadata[,-1] ## The -1 removes the Sequencing Batch info
+  CoefficientMatrixFCC = CoefficientMatrix[,7:(6+NumberOfTechnicalVariablesBB)]
+  ## 7 is here because there is 1 column for the intercept and 5 columns for Sequencing batches.
+  BatchCoefficientMatrixFCC = CoefficientMatrix[,2:6]
+  
+  
+  ##----------------------------------------------------------------------------
+  ## Correcting for Technical Variables (not including sequencing batch):
+  ##----------------------------------------------------------------------------
+  for (j in 1:NumberOfKidsOfInterest) {
+    if (class(MetadataFCC)=="data.frame") {
+      CurrentCovariateValues = as.numeric(MetadataFCC[j, ])
+    } else {
+      CurrentCovariateValues = as.numeric(MetadataFCC[j])
+    }
+    
+    for (i in 1:NumberOfAllRNAsPresently) {
+      if (class(CoefficientMatrixFCC)=="numeric") {
+        CurrentCoefficentArray = as.numeric(CoefficientMatrixFCC[i])
+      } else {
+        CurrentCoefficentArray = as.numeric(CoefficientMatrixFCC[i, ])
+      }
+      
+      ## The "1+" is there because the first column in the CoefficientMatrix is the intercept.
+      CorrectionFactor = 2^(CurrentCoefficentArray %*% CurrentCovariateValues) 
+      NewCountMatrix[i,j] = ForCorrectionUCMatrixConverged[i,j]/(CorrectionFactor) 
+    }
+  }
+  CorrectedCountMatrix = NewCountMatrix
+  
+  
+  ##----------------------------------------------------------------------------
+  ## Correcting for Sequencing Batch:
+  ##----------------------------------------------------------------------------
+  for (j in 1:NumberOfKidsOfInterest) {
+    CurrentBatch = as.numeric(ForCorrectionMetadata[j, 1]) - 1 ## This is the sequencing batch
+    ## The -1 is there because as.numeric adds 1 due to there being a batch 0.
+    
+    for (i in 1:NumberOfAllRNAsPresently) {
+      ## The first entry is batch 1vs0. The 2nd entry is batch 2vs0. etc.
+      BatchCoefficient = BatchCoefficientMatrixFCC[i, CurrentBatch]
+      if (CurrentBatch == 0) {
+        BatchCorrectionFactor = 1
+      } else {
+        BatchCorrectionFactor = 2 ^ (BatchCoefficient)
+      }
+      CorrectedCountMatrix[i, j] = NewCountMatrix[i, j] / BatchCorrectionFactor
+    }
+    
+  }
+  
+  ## Recording the corrected count matrix so that we can run outer cross validation later
+  ## and won't have to run DESeq2 again:
+  CountMatrixList[[o]] = CorrectedCountMatrix
+  
+  
+  ##============================================================================
+  ## Running Differential Expression for the Outcome of Interest and
+  ## Getting p-values for the RNAs' Association with the Outcome of Interest:
+  ##============================================================================
+  
+  ## Rounding: Now I round the corrected counts so that they can be used in DESeq2 again:
+  RoundedCountsMatrixRTI = round(CorrectedCountMatrix)
+  NAInds = is.na(RoundedCountsMatrixRTI)
+  CountsMatrixRTI = RoundedCountsMatrixRTI
+  CountsMatrixRTI[NAInds] = 0
+  
+  ## This is so that we only use the non-testing samples for determining the differentialy
+  ## expressed RNAs:
+  NonTestingCountsMatrix = CountsMatrixRTI[,NonTestingBarcodes]
+  NonTestingMetadata = Metadata[NonTestingBarcodes,]
+  
+  ## Executing the DESeq2 functions:
+  dds = DESeqDataSetFromMatrix(countData = NonTestingCountsMatrix, 
+                               colData = NonTestingMetadata, 
+                               design = ~ CaseOrControl)   
+  
+  dds = DESeq(dds)
+  ddsOriginal = dds
+  DEGConvergenceFilter = which(mcols(dds)$betaConv)
+  dds = dds[DEGConvergenceFilter,]
+  
+  
+  DEResultsDF = data.frame(results(dds, contrast = ContrastVariables, pAdjustMethod = "fdr"))
+  RNAList = rownames(DEResultsDF)
+  
+  IndicesOfRNAsAscendingOrder = order(DEResultsDF$padj)
+  
+  AllIndicesOfDERNAs = IndicesOfRNAsAscendingOrder[1:MaxNumberOfInputRNAs]
+  AllInputRNANamesOrdered = RNAList[AllIndicesOfDERNAs]
+  InputRNANamesOrderedList[[o]] = AllInputRNANamesOrdered
+  
+  ##----------------------------------------------------------------------------
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  ##============================================================================
+  ## Initializing Tensors for Inner Cross Validation:
+  ##============================================================================
+  
+  Zeros = rep(0, NumberOfLambdas * NumberOfUs * kin * NumberOfCutOffs)
+  MinusOnes = rep(-1, NumberOfLambdas * NumberOfUs * NumberOfCutOffs)
+  
+  ## For each hyperparameter set, we will run inner cross validation and compute 
+  ## the accuracy of the each run of inner cross validation. We will then compute the mean 
+  ## of these accuracies. This mean accuracy will be stored in MeanAccuracyTensor.
+  ## (Similarly for MeanSensitivityTensor, etc):
+  
+  MeanAccuracyTensor = array(MinusOnes,
+                             c(NumberOfLambdas, NumberOfUs, NumberOfCutOffs))
+ 
+  MeanSensitivityTensor = array(MinusOnes,
+                                c(NumberOfLambdas, NumberOfUs, NumberOfCutOffs))
+  
+  MeanSpecificityTensor = array(MinusOnes,
+                                c(NumberOfLambdas, NumberOfUs, NumberOfCutOffs))
+  
+  MeanF1Tensor = array(MinusOnes,
+                       c(NumberOfLambdas, NumberOfUs, NumberOfCutOffs))
+ 
+  MeanAUCTensor = array(MinusOnes,
+                        c(NumberOfLambdas, NumberOfUs))
+ 
+  MeanPPVTensor = array(MinusOnes,
+                        c(NumberOfLambdas, NumberOfUs, NumberOfCutOffs))
+ 
+  MeanNPVTensor = array(MinusOnes,
+                        c(NumberOfLambdas, NumberOfUs, NumberOfCutOffs))
+ 
+ 
+    
+    
+    
+  ##==============================================================================
+  ##==============================================================================
+  ## Inner Cross Validation Loop Begins Here:
+    
+  ## This is largely the same code as in the outer cross validation loop except here in 
+  ## this inner cross validation loop, we're not using the kids from the outer cross 
+  ## validation fold.
+  ##============================================================================== 
+  ##==============================================================================
+  
+  Lists = rep(list(), NumberOfLambdas*NumberOfUs)
+  ListOfPredictions = array(Lists, c(NumberOfLambdas, NumberOfUs) )
+  ListOfOutcomes = array(Lists, c(NumberOfLambdas, NumberOfUs) )
+  
+  ## r is the fold of inner cross validation:
+  for (r in 1:kin) {
+      
+    print("Current Inner Cross Validation Fold")
+    print(r)
+      
+      
+  ##==============================================================================
+  ## Defining the Samples that We Will Use in this Fold of Inner Cross Validation
+  ##==============================================================================
+  
+  ## Here we use the SubsetIndices to divide the the counts matrix and response 
+  ## vector into training and validation counts matrices and response vectors. 
+
+  ## Defining Barcodes:
+  NonTestingBarcodes = EvenlyReorderedBarcodes[ -SubsetIndices[[o]] ]
+  if (CrossValidationOption == 2) {
+    NonTestingBarcodes = EvenlyReorderedBarcodes
+  }
+    ValidationBarcodes = NonTestingBarcodes[ SubsetIndicesForIL[[r]] ]
+    TrainingBarcodes = NonTestingBarcodes[ -SubsetIndicesForIL[[r]] ]
+      TrainingAndOtherBarcodes = c(TrainingBarcodes, BarcodesOfOtherSamples)
+  
+  ## Defining Uncorrected Counts (UC) Matrices:
+  TrainingAndOtherUCMatrix = RawCountMatrix[filter, TrainingAndOtherBarcodes] 
+  ForCorrectionUCICMatrix = NormalizedCountsMatrix[filter, c(TrainingBarcodes, ValidationBarcodes)] 
+    #UCIC Stands for Uncorrected Counts Inner Cross-validation
+  
+  ## Defining Metadata:
+  TrainingAndOtherMetadata = Metadata[TrainingAndOtherBarcodes,] 
+  ForCorrectionMetadata = Metadata[c(TrainingBarcodes, ValidationBarcodes), CovariateArray]
+
+  ## Defining Response Vectors:
+  NonTestingResponseVector = FinalResponseVector[ -SubsetIndices[[o]] ]
+  if (CrossValidationOption == 2) {
+    NonTestingResponseVector = FinalResponseVector
+  }
+    ValidationResponseVector = NonTestingResponseVector[ SubsetIndicesForIL[[r]] ]
+    TrainingResponseVector = NonTestingResponseVector[ -SubsetIndicesForIL[[r]] ]
+  
+  NumberOfTrainingKids = length(TrainingResponseVector)
+  NumberOfValidationKids = length(ValidationResponseVector)
+  
+   
+  ##============================================================================
+  ## Running DESeq2 Differential Expression Analysis for Technical Variables 
+  ## so that we can obtain the coefficients for the technical variables
+  ## that allow us to correct the counts for the technical variables:
+  ##============================================================================
+  
+  ## Executing the DESeq2 functions:
+  dds = DESeqDataSetFromMatrix(countData = TrainingAndOtherUCMatrix, 
+                             colData = TrainingAndOtherMetadata, 
+                             design = MyDesignFormula)  
+  
+  dds = DESeq(dds)
+  ddsOriginal = dds
+  CorrectionConvergenceFilter = which(mcols(dds)$betaConv)
+  dds = dds[CorrectionConvergenceFilter,]
+  
+  CoefficientMatrix = coef(dds)
+  
+  
+  ##==============================================================================
+  ## Correcting the Count Matrix
+  ##==============================================================================
+  
+  ## This is the number of RNAs after removal of 
+  ## low count RNAs and RNAs whose coefficients did not converge:
+  NumberOfAllRNAsPresently = dim(CoefficientMatrix)[1] 
+  
+  ## ConvergenceFilter is the RNAs that converged during the DESeq2 analysis of 
+  ## all the non-testing and other samples used for batch and technical variable 
+  ## information. For any RNAs that did not converge, we can't determine coefficients, 
+  ## so we can't correct that RNA's counts. Thus we get rid of those RNAs by applying 
+  ## the filter to the ForCorrectionUCICMatrix:
+  ForCorrectionUCICMatrixConverged = ForCorrectionUCICMatrix[CorrectionConvergenceFilter,] 
+  NewCountMatrix = ForCorrectionUCICMatrixConverged
+  
+  MetadataFCC = ForCorrectionMetadata[,-1] ## The -1 removes the Sequencing Batch info
+  CoefficientMatrixFCC = CoefficientMatrix[,7:(6+NumberOfTechnicalVariablesBB)]
+  ## 7 is here because there is 1 column for the intercept and 5 columns for Sequencing batches.
+  BatchCoefficientMatrixFCC = CoefficientMatrix[,2:6]
+  
+  ##----------------------------------------------------------------------------
+  ## Correcting for Technical Variables (not including sequencing batch):
+  ##----------------------------------------------------------------------------
+  for (j in 1:(NumberOfTrainingKids+NumberOfValidationKids) ) {
+    if (class(MetadataFCC)=="data.frame") {
+      CurrentCovariateValues = as.numeric(MetadataFCC[j, ])
+    } else {
+      CurrentCovariateValues = as.numeric(MetadataFCC[j])
+    }
+    
+    for (i in 1:NumberOfAllRNAsPresently) {
+      if (class(CoefficientMatrixFCC)=="numeric") {
+        CurrentCoefficentArray = as.numeric(CoefficientMatrixFCC[i])
+      } else {
+        CurrentCoefficentArray = as.numeric(CoefficientMatrixFCC[i, ])
+      }
+      
+      ## The "1+" is there because the first column in the CoefficientMatrix is the intercept.
+      CorrectionFactor = 2^(CurrentCoefficentArray %*% CurrentCovariateValues) 
+      NewCountMatrix[i,j] = ForCorrectionUCICMatrixConverged[i,j]/(CorrectionFactor) 
+    }
+  }
+  CorrectedCountMatrix = NewCountMatrix
+  
+  
+  ##----------------------------------------------------------------------------
+  ## Correcting for Sequencing Batch:
+  ##----------------------------------------------------------------------------
+  for (j in 1:(NumberOfTrainingKids + NumberOfValidationKids)) {
+    CurrentBatch = as.numeric(ForCorrectionMetadata[j, 1]) - 1 ## This is the sequencing batch
+    ## The -1 is there because as.numeric adds 1 because there's a batch 0.
+    
+    for (i in 1:NumberOfAllRNAsPresently) {
+      ## The first entry is batch 1vs0. The 2nd entry is batch 2vs0. etc.
+      BatchCoefficient = BatchCoefficientMatrixFCC[i, CurrentBatch]
+      if (CurrentBatch == 0) {
+        BatchCorrectionFactor = 1
+      } else {
+        BatchCorrectionFactor = 2 ^ (BatchCoefficient)
+      }
+      CorrectedCountMatrix[i, j] = NewCountMatrix[i, j] / BatchCorrectionFactor
+    }
+  }
+
+  
+  ##============================================================================
+  ## Running Differential Expression for the Outcome of Interest and
+  ## Getting p-values for the RNAs' Association with the Outcome of Interest:
+  ##============================================================================
+  
+  ## Rounding: Now I round the corrected counts so that they can be used in DESeq2 again:
+  RoundedCountsMatrixRTI = round(CorrectedCountMatrix)
+  NAInds = is.na(RoundedCountsMatrixRTI)
+  CountsMatrixRTI = RoundedCountsMatrixRTI
+  CountsMatrixRTI[NAInds] = 0
+  
+  ## This is so that we only use the non-testing samples for determining the DEGs:
+  TrainingCountMatrix = CountsMatrixRTI[,TrainingBarcodes]
+  TrainingMetadata = Metadata[TrainingBarcodes,]
+  
+  ## Executing the DESeq2 functions:
+  dds = DESeqDataSetFromMatrix(countData = TrainingCountMatrix, 
+                               colData = TrainingMetadata, 
+                               design = ~ CaseOrControl)   
+  dds = DESeq(dds)
+  ddsOriginal = dds
+  DEGConvergenceFilter = which(mcols(dds)$betaConv)
+  dds = dds[DEGConvergenceFilter,]
+  
+  
+  DEResultsDF = data.frame(results(dds, contrast = ContrastVariables, pAdjustMethod = "fdr"))
+  RNAList = rownames(DEResultsDF)
+  
+  IndicesOfRNAsAscendingOrder = order(DEResultsDF$padj)
+  
+  AllIndicesOfDERNAs = IndicesOfRNAsAscendingOrder[1:MaxNumberOfInputRNAs]
+  AllInputRNANamesOrdered = RNAList[AllIndicesOfDERNAs]
+  
+  OrderedAdjPValues = DEResultsDF[IndicesOfRNAsAscendingOrder,'padj']
+  CorrespondingAdjPVector = OrderedAdjPValues[UArray]
+  
+  
+
+      
+      
+
+      
+      
+   
+  ##==============================================================================
+  ## Looping through Different Numbers of RNAs to Input into the Lasso Regularization:
+  ##==============================================================================
+  
+  for (UIndex in 1:NumberOfUs) {
+   
+    NumberOfInputRNAs = UArray[UIndex]
+    
+    ## The CorrectedCountMatrix is essentially the concatination of the Training Count Matrix and  
+    ## the Validation Count Matrices, so here I divide it up into its component count matrices. 
+    ## Also, I only include the top differentially expressed RNAs up until the NumberOfInputRNAs:
+    TrainingCountMatrix = 
+      CorrectedCountMatrix[AllInputRNANamesOrdered[1:NumberOfInputRNAs],1:NumberOfTrainingKids]
+    ValidationCountMatrix = 
+      CorrectedCountMatrix[AllInputRNANamesOrdered[1:NumberOfInputRNAs], 
+                             ((NumberOfTrainingKids+1):(NumberOfTrainingKids + NumberOfValidationKids) )]    
+    ##--------------------------------------------------------------------------
+    ## Here we fit the multiple logistic regression model with lasso regularization:
+    ##--------------------------------------------------------------------------
+    fit1 = glmnet(
+      t(TrainingCountMatrix),
+      as.factor(TrainingResponseVector),
+      family = "binomial",
+      alpha = 1,
+      nlambda = NumberOfLambdas,
+      lambda.min.ratio =  MinimumLambdaRatio
+    )
+    CurrentNumberOfLambdas = length(fit1$lambda)
+    
+    ## Now we loop through the values of the hyperparameter lambda:
+    for (LambdaNum in 1:CurrentNumberOfLambdas) {
+      
+      ## Here we make predictions for the validation set so that we can assess the accuracy of
+      ## the model with the current hyperparameter set:
+      FitCoeffs = coef(fit1, s = fit1$lambda[LambdaNum])
+      PredictedData = predict(
+        fit1,
+        newx = t(ValidationCountMatrix),
+        s = fit1$lambda[LambdaNum],
+        type = "response"
+      )
+      
+      ListOfPredictions[[LambdaNum, UIndex]] = 
+        c(ListOfPredictions[[LambdaNum, UIndex]], PredictedData)
+      
+      ListOfOutcomes[[LambdaNum, UIndex]] = 
+        c(ListOfOutcomes[[LambdaNum, UIndex]], ValidationResponseVector)
+    }
+  }
+  }
+    
+
+  for (UIndex in 1:NumberOfUs) {
+    for (LambdaNum in 1:NumberOfLambdas) {
+      ValidationResponseVector = ListOfOutcomes[[LambdaNum, UIndex]]
+      PredictedData = as.numeric(ListOfPredictions[[LambdaNum, UIndex]])
+      
+      ROC_Object = roc(ValidationResponseVector, PredictedData, quiet = TRUE)
+      AUCValue = as.numeric(auc(ROC_Object))
+      MeanAUCTensor[LambdaNum, UIndex] = AUCValue
+      
+      
+      ##----------------------------------------------------------------------
+      ## This section determines the performance metrics (accuracy, sensitivity, etc.)
+      ## for the model when using different values of the CutOff. We calculate the
+      ## metrics from predictions pooled across inner cross validation runs in order
+      ## to get the mean values of the metrics across inner cross validation folds:
+      ##------------------------------------------------------------------------
+      
+      for (CutOffNum in 1:NumberOfCutOffs) {
+        CutOff = CutOffArray[CutOffNum]
+        TruePos = 0
+        TrueNeg = 0
+        FalsePos = 0
+        FalseNeg = 0
+        
+        ##----------------------------------------------------------------------
+        ## Here we're looping through all children in the inner cross validation
+        ## to see if the model correctly or incorrectly predicted them, 
+        ## and we record them as true or false positives or negatives:
+        ##----------------------------------------------------------------------
+        for (PersonNum in 1:length(PredictedData)) {
+          if (ValidationResponseVector[PersonNum] > CutOff &
+              PredictedData[PersonNum] > CutOff) {
+            TruePos = TruePos + 1
+          } else if (ValidationResponseVector[PersonNum] > CutOff &
+                     PredictedData[PersonNum] < CutOff) {
+            FalseNeg = FalseNeg + 1
+          } else if (ValidationResponseVector[PersonNum] < CutOff &
+                     PredictedData[PersonNum] > CutOff) {
+            FalsePos = FalsePos + 1
+          } else if (ValidationResponseVector[PersonNum] < CutOff &
+                     PredictedData[PersonNum] < CutOff) {
+            TrueNeg = TrueNeg + 1
+          }
+        }
+        
+        Accuracy = (TrueNeg + TruePos) / (TrueNeg + TruePos + FalseNeg + FalsePos)
+        Sensitivity = TruePos / (TruePos + FalseNeg)
+        Specificity = TrueNeg / (TrueNeg + FalsePos)
+        PPV = TruePos / (TruePos + FalsePos)
+        F1 = 2 * PPV * Sensitivity / (PPV + Sensitivity)
+        NPV = TrueNeg / (TrueNeg + FalseNeg)
+        
+        MeanF1Tensor[LambdaNum, UIndex, CutOffNum] = F1
+        MeanAccuracyTensor[LambdaNum, UIndex, CutOffNum] = Accuracy
+        MeanSensitivityTensor[LambdaNum, UIndex, CutOffNum] = Sensitivity
+        MeanSpecificityTensor[LambdaNum, UIndex, CutOffNum] = Specificity
+        MeanPPVTensor[LambdaNum, UIndex, CutOffNum] = PPV
+        MeanNPVTensor[LambdaNum, UIndex, CutOffNum] = NPV
+      }
+    }
+  }
+  
+  ## Storing the tensors (containing the results of inner cross validation) in larger tensors:
+  MeanF1TOC[,,o,] = MeanF1Tensor 
+  MeanAccuracyTOC[,,o,] = MeanAccuracyTensor
+  MeanSensitivityTOC[,,o,] = MeanSensitivityTensor  
+  MeanSpecificityTOC[,,o,] = MeanSpecificityTensor  
+  MeanPPVTOC[,,o,] = MeanPPVTensor  
+  MeanNPVTOC[,,o,] = MeanNPVTensor  
+  MeanAUCTOC[,,o] = MeanAUCTensor
+  
+}
+
+
+##------------------------------------------------------------------------------
+## Saving the Results of Cross Validation to an RData File:
+##------------------------------------------------------------------------------
+
+if (SaveFileOption == 1) {
+  save(CountMatrixList, FinalResponseVector, SubsetIndices, InputRNANamesOrderedList,
+       ReorderingIndices, EvenlyReorderedBarcodes, MySeed,
+       MeanF1TOC, MeanAccuracyTOC, 
+       MeanSensitivityTOC, MeanSpecificityTOC, 
+       MeanPPVTOC, MeanNPVTOC, MeanAUCTOC, 
+       file = FullNameOfOutputFile)
+}
+
+```
+
+

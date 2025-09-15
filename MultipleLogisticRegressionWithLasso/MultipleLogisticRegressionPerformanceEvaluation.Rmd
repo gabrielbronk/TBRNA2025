@@ -1,0 +1,866 @@
+---
+title: "Performance Evaluation of the Multiple Logistic Regression with Lasso for TB"
+author: "Gabriel Bronk, PhD"
+date: "2025-08-01"
+output: html_document
+---
+
+## This script evaluates the performance of the predictive model from nested cross validation. 
+## Alternatively, if you are only doing inner cross validation (not nested), then the script determines
+## the model's coefficients.
+
+## This script will take a few minutes to run on a laptop.
+
+##===================================================================================================
+## IMPORTANT: Choose your directory here, and open "OptionsForMultipleLogisticRegression.R" to select the options you want to use:
+##===================================================================================================
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## Write your directory name here:
+MyDirectory = 'c:/Users/gbron/OneDrive - Mass General Brigham/Documents/AKlengelLab/R01Project/GitHubForTB/Data'
+
+knitr::opts_knit$set(root.dir = MyDirectory)
+```
+
+##===================================================================================================
+## IMPORTANT: Choose the optimization options you want to use here:
+##===================================================================================================
+
+```{r}
+
+## Here you choose which performance metric you want the model to be optimized for. For example, if you choose PerformanceMetricOption = 1, the script will pick the hyperparameter set that causes the model to have the highest F1 score. However, we generally just optimize for AUC. 
+
+PerformanceMetricOption = 5
+## Option 1 is F1 Score
+## Option 2 is Accuracy
+## Option 5 is AUC
+## Option 6 is PPV
+## Option 7 is NPV
+## Option 10 is balancing sensitivity and PPV (i.e. getting sensitivity to be in a certain range, followed by PPV maximization).
+
+## NOTE: If you want optimize F1 score, then you can use the code as is, or perhaps you would achieve a better F1 by allowing the cut off be any value from the CutOffVector (see below), not just 0.5. Or perhaps you could try optimizing for accuracy with a cut off of 0.5, and then let the cut off be variable and optimize for F1 (as in the VariedCutOffOption below).
+
+VariedCutOffOption = 0
+## Use option 0 if you want the cut off to be fixed at 0.5 - this is for obtaining the accuracy or AUC. You'll probably want to start with option 0, but if you want to let the cut off be varied so that you can optimize PPV or NPV, then go with option 1, which is described in the next line:
+## Use option 1 if you want the cut off to be fixed at 0.5 when optimizing for F1, accuracy, or AUC but then allow the cut off to be changed when optimizing for PPV or NPV. Make sure to select optimizing for F1, accuracy, or AUC in the PerformanceMetricOption above, and then the script will output the optimal PPV or NPV that you specify in the SecondaryPerformanceMetricOption (see a few lines down from here).
+## WARNING: When using this option, you will not get the best accuracy because the cut off is optimized for PPV or NPV. See CutOffBackToOneHalfOption for how to still get the best accuracy.
+
+##------------------------------------------------------------------------------
+## If You are Using VariedCutOffOption = 1, then Choose What You Want for These Options:
+##------------------------------------------------------------------------------
+
+SecondaryPerformanceMetricOption = 6
+## After optimizing the hyperparameters lambda and U to achieve a model with the best accuracy, F1, or AUC, then the cut-off hyperparameter is changed to optimize for one of these secondary accuracy measures: 
+## Use SecondaryPerformanceMetricOption = 6 to optimize for PPV
+## Use SecondaryPerformanceMetricOption = 7 to optimize for NPV
+
+CutOffBackToOneHalfOption = 0
+## Use 0 to not use this option.
+## Use 1 if you want to use the hyperparameter set that was found for PPV or NPV but change the cut off back to 0.5 to to see what the other performance metrics are for that hyperparameter set (i.e. accuracy, AUC, F1, sensitivity, specificity). (To summarize what happened so far, the script found the the hyperparameter sets that give the best accuracy, F1, or AUC (there may be multiple hyperparameter sets that are equally good), and then of those hyperparamter sets, it chose which of those hyperparameter sets gave you the best PPV or NPV, narrowing down to a single hyperparameter set to use. Now, with CutOffBackToOneHalfOption = 1, the script changes back to a cut off of 0.5 in order to tell you what the other performance metrics are for that hyperparameter set (i.e. accuracy, AUC, F1, sensitivity, specificity)).
+
+##------------------------------------------------------------------------------
+## Putting Constraints on Hyperparameters:
+##------------------------------------------------------------------------------
+
+LambdaNumsToUse = 1:13 ## By having LambdaNumber be no more than 13, this causes the lasso regularization to choose only a small number of RNAs to include in the model.
+UIndicesToUse = 1:length(UArray)  
+
+
+## The parameters below are used when using PerformanceMetricOption = 10:
+
+## This obtains hyperparameter sets with sensitivities within this range:
+SensitivityUpperBound = 0.3
+SensitivityLowerBound = 0.2
+## This obtains hyperparamter sets with AUCs within a certain range. For example, if AUCWindow = 0.015, then it allows the script to obtain hyperparameter sets that achieve AUCs 0.015 lower than the best AUC (giving more flexibility in case a hyperparamter set with slightly lower AUC achieves a better sensitivity or PPV):
+AUCWindow = 0.015 
+
+```
+
+
+## Loading R packages and loading data:
+
+```{r}
+library(DESeq2)
+library(readxl)
+library(pROC)
+library(glmnet)
+library(matrixStats)
+
+load('AgesOfTSTConversionAndTBDiagnosis.RData')
+```
+
+```{r}
+source('../MultipleLogisticRegressionWithLasso/OptionsForMultipleLogisticRegression.R')
+```
+
+## Loading the results of nested cross validation:
+
+```{r}
+FileNameToLoad = paste(NameOfOutputFile, 'Combined.RData', sep="")
+load(FileNameToLoad)
+```
+
+
+
+
+
+
+
+##==============================================================================
+##==============================================================================
+## NO MORE INPUTS ARE NEEDED BEYOND THIS POINT
+## (i.e. you do not need to modify the code below here).
+##==============================================================================
+##==============================================================================
+
+
+
+
+
+
+
+
+
+```{r}
+## This determines which indices of the CutOffVector to use, in accordance with the options that you selected above.
+
+if (VariedCutOffOption == 0) {
+  CutOffIndicesToUse = which((CutOffVector %in% 0.5) == TRUE) 
+} else if (VariedCutOffOption == 1) {
+  CutOffIndicesToUse = 1:length(CutOffVector) 
+}
+
+```
+
+##==============================================================================
+## Determination of Optimal Hyperparameter Set for Your Chosen Performance Metric
+##==============================================================================
+
+## For each fold of outer cross validation, we determine the optimal hyperparameters 
+## (since we need to get the best hyperparameter set from the training/validation 
+## data for each fold of outer cross validation).
+
+```{r}
+
+NumberArray = 1:(length(LambdaNumsToUse)*NumberOfHowManyInputs*NumberOfCutOffs)
+TranslationTensor = array(NumberArray,
+                           c(length(LambdaNumsToUse), NumberOfHowManyInputs, NumberOfCutOffs))
+InitialBestCoordsList = list()
+
+## HPMatrix stores the best Hyperparameter values in the LambdaNum and CutOff columns, and then stores the ## range of best hyperparameter values in the other columns (B means bottom of the range and 
+## T means top of the range).
+## I fill the whole matrix with the number 1000 just to initialize the matrix:
+HPMatrix = matrix(1000,k,10)
+colnames(HPMatrix) = c('LambdaNumber','CutOff',
+                       'LambdaNumber B', 'LambdaNumber T',
+                       'NumberOfRNAs', 'NumberOfRNAs B', 'NumberOfRNAs T')
+
+
+## For each outer cross validation fold, this stores the mean accuracy across inner cross validation folds:
+InnerCVMeanAccuracyArray = c()
+## For each outer cross validation fold, this stores the AUC across inner cross validation folds:
+InnerCVAUCArray = c()
+
+if (CrossValidationOption == 1) {
+  FoldsToOptimize = 1:k
+} else if (CrossValidationOption == 2) {
+  FoldsToOptimize = 1
+}
+
+
+##==============================================================================
+## This loops through all folds of outer cross validation:
+
+for (o in FoldsToOptimize) {
+  
+  ## We first find the coordinates of the hyperparameter set that yields the best 
+  ## value of the performance metric that you chose:
+  if (PerformanceMetricOption == 1) {
+    MeanF1TensorReduced = MeanF1TOC[LambdaNumsToUse, UIndicesToUse, o, CutOffIndicesToUse]
+    NAIndicesInTensor = which(is.na(MeanF1TensorReduced) == TRUE)
+    MeanF1TensorReduced[NAIndicesInTensor] = 0
+    BestValue = max(MeanF1TensorReduced)
+    InitialBestCoords = which(MeanF1TensorReduced == BestValue, arr.ind = TRUE)
+    
+  } else if (PerformanceMetricOption == 2) {
+    MeanAccuracyTensorReduced = MeanAccuracyTOC[LambdaNumsToUse, UIndicesToUse, o, CutOffIndicesToUse]
+    NAIndicesInTensor = which(is.na(MeanAccuracyTensorReduced) == TRUE)
+    MeanAccuracyTensorReduced[NAIndicesInTensor] = 0
+    BestValue = max(MeanAccuracyTensorReduced)
+    InitialBestCoords = which(MeanAccuracyTensorReduced == BestValue, arr.ind = TRUE)
+    
+  } else if (PerformanceMetricOption == 5) {
+    MeanAUCTensorReduced = MeanAUCTOC[LambdaNumsToUse, UIndicesToUse, o]
+    NAIndicesInTensor = which(is.na(MeanAUCTensorReduced) == TRUE)
+    MeanAUCTensorReduced[NAIndicesInTensor] = 0
+    BestValue = max(MeanAUCTensorReduced)
+    InitialBestCoords = which(MeanAUCTensorReduced == BestValue, arr.ind = TRUE)
+  
+  } else if (PerformanceMetricOption == 6) {
+    MeanPPVTensorReduced = MeanPPVTOC[LambdaNumsToUse, UIndicesToUse, o, CutOffIndicesToUse]
+    NAIndicesInTensor = which(is.na(MeanPPVTensorReduced) == TRUE)
+    MeanPPVTensorReduced[NAIndicesInTensor] = 0
+    BestValue = max(MeanPPVTensorReduced)
+    InitialBestCoords = which(MeanPPVTensorReduced == BestValue, arr.ind = TRUE)
+  
+  } else if (PerformanceMetricOption == 7) {
+    MeanNPVTensorReduced = MeanNPVTOC[LambdaNumsToUse, UIndicesToUse, o, CutOffIndicesToUse]
+    NAIndicesInTensor = which(is.na(MeanNPVTensorReduced) == TRUE)
+    MeanNPVTensorReduced[NAIndicesInTensor] = 0
+    BestValue = max(MeanNPVTensorReduced)
+    InitialBestCoords = which(MeanNPVTensorReduced == BestValue, arr.ind = TRUE)
+  
+  } else if (PerformanceMetricOption == 10) {
+    MeanAUCTensorReduced = MeanAUCTOC[LambdaNumsToUse, UIndicesToUse, o]
+    NAIndicesInTensor = which(is.na(MeanAUCTensorReduced) == TRUE)
+    MeanAUCTensorReduced[NAIndicesInTensor] = 0
+    BestValue = max(MeanAUCTensorReduced)
+    InitialLinearAUCInds = which(MeanAUCTensorReduced >= (BestValue - AUCWindow))
+  
+  }
+  
+  
+  
+  
+  ## Now that we have optimized accuracy or AUC (or F1) using a cut off of 0.5,
+  ## we will take the hyperparameter set that we obtained for accuracy or AUC (or F1)
+  ## and then we will vary the cut off to optimize PPV or NPV: 
+  if (VariedCutOffOption == 1) { ##---------------------------------------------
+ 
+    if (length(InitialBestCoords) > 3) {
+      LambdaIndices = InitialBestCoords[, 1]
+      UIndices = InitialBestCoords[, 2]
+    } else {
+      LambdaIndices = InitialBestCoords[1]
+      UIndices = InitialBestCoords[2]
+    }
+    NumOfBestCoords = length(LambdaIndices) 
+    
+    ## If there is only 1 optimal hyperparameter set, then this isn't really a loop.
+    ## But if there are multiple optimal hyperparameter sets, then we loop through them
+    ## to see which gives the best secondary performance metric (either PPV or NPV, depending 
+    ## on what you chose):
+    PreviousBestValue = 0 ## This is to initiate the loop.
+    for (J in 1:NumOfBestCoords) {
+      
+      if (SecondaryPerformanceMetricOption == 6) {
+        
+        MeanPPVTensorReduced = MeanPPVTOC[LambdaIndices[J],UIndices[J],o,]
+        NAIndicesInTensor = which(is.na(MeanPPVTensorReduced) == TRUE)
+        MeanPPVTensorReduced[NAIndicesInTensor] = 0
+        BestValue = max(MeanPPVTensorReduced)
+        
+        if (BestValue > PreviousBestValue) {
+          BestNewCutOffIndices = which(MeanPPVTensorReduced == BestValue)
+          BestNewCutOffs = CutOffVector[BestNewCutOffIndices]
+          
+          ## It's possible that multiple cut offs will yield the same value of PPV.
+          ## In this case, we just choose the first (i.e. lowest) cut off 
+          ## because this will give us the greatest sensitivity. (NOTE: Here we're prioritizing PPV 
+          ## and then taking the best sensitivity we can get. Of course, if we wanted,
+          ## we could code this to put more of a priority on sensitivity and take a slightly worse PPV).
+          BestNewCutOff = BestNewCutOffs[1]
+          BestNewCutOffIndex = BestNewCutOffIndices[1]
+          
+          BestJ = J
+          PreviousBestValue = BestValue
+        }
+        
+      } else if (SecondaryPerformanceMetricOption == 7) {
+        
+          MeanNPVTensorReduced = MeanNPVTOC[LambdaIndices[J],UIndices[J],o,]
+          NAIndicesInTensor = which(is.na(MeanNPVTensorReduced) == TRUE)
+          MeanNPVTensorReduced[NAIndicesInTensor] = 0
+          BestValue = max(MeanNPVTensorReduced)
+        
+          if (BestValue > PreviousBestValue) {
+            BestNewCutOffIndices = which(MeanNPVTensorReduced == BestValue)
+            BestNewCutOffs = CutOffVector[BestNewCutOffIndices]
+            
+            ## It's possible that multiple cut offs will yield the same value of NPV.
+            ## In this case, we just choose the last (i.e. highest) cut off 
+            ## because this will give us the greatest specificity. (NOTE: Here we're prioritizing NPV 
+            ## and then taking the best specificity we can get. Of course, if we wanted,
+            ## we could code this to put more of a priority on specificity and take a slightly worse NPV).
+            NumberOfFoundCutOffs = length(BestNewCutOffs) 
+            BestNewCutOff = BestNewCutOffs[NumberOfFoundCutOffs]
+            BestNewCutOffIndex = BestNewCutOffIndices[NumberOfFoundCutOffs]
+            
+            BestJ = J
+            PreviousBestValue = BestValue
+          }
+      
+      }
+    }
+    
+    
+    if (length(InitialBestCoords) > 3) {
+      BestLambdaIndex = InitialBestCoords[BestJ, 1]
+      BestUIndex = InitialBestCoords[BestJ, 2]
+    } else {
+      BestLambdaIndex = InitialBestCoords[1]
+      BestUIndex = InitialBestCoords[2]
+    }
+    BestCoords = c(BestLambdaIndex, BestUIndex, BestNewCutOffIndex)
+  }
+  ##----------------------------------------------------------------------------
+ 
+  
+  
+  if (VariedCutOffOption == 0) {
+   
+      if (PerformanceMetricOption == 10) {
+        
+        ## This loop records all indices for which the AUC is at least the maximum AUC minus AUCwindow,
+        ## and we look at all cut-offs so that we can then look at their sensitivity values:
+        InitialLinearAUCIndsWithCutOffs = InitialLinearAUCInds
+        for (f in 1:(NumberOfCutOffs-1)) {
+          InitialLinearAUCIndsWithCutOffs = c(InitialLinearAUCIndsWithCutOffs, 
+           (f*length(LambdaNumsToUse)*length(UIndicesToUse) + InitialLinearAUCInds)
+           )
+        }
+        ## Now we use the good AUC indices in the sensitivity tensors to see what the sensitivities 
+        ## are for these hyperparameter sets:
+        MeanSensitivityTensorReduced =
+          MeanSensitivityTOC[LambdaNumsToUse,UIndicesToUse,o,CutOffIndicesToUse]
+        ArrayOfSensitivitiesWithGoodAUC = MeanSensitivityTensorReduced[InitialLinearAUCIndsWithCutOffs]
+        NanIns = which(is.na(ArrayOfSensitivitiesWithGoodAUC)==TRUE)
+        ArrayOfSensitivitiesWithGoodAUC[NanIns] = 0
+        SecondLinearIndices = 
+        which(ArrayOfSensitivitiesWithGoodAUC >= SensitivityLowerBound & ArrayOfSensitivitiesWithGoodAUC <= SensitivityUpperBound)
+        ## Now we narrow down the good AUC indices to just have indices with decent sensitivities:
+        ThirdLinearIndices = InitialLinearAUCIndsWithCutOffs[SecondLinearIndices] 
+        MeanPPVTensorReduced = MeanPPVTOC[LambdaNumsToUse,UIndicesToUse,o,CutOffIndicesToUse]
+        ArrayOfPPVsWithGoodSensitivity = MeanSensitivityTensorReduced[ThirdLinearIndices]
+        ## This is the best PPV value:
+        BestValue = max(ArrayOfPPVsWithGoodSensitivity, na.rm = TRUE) 
+        FourthLinearIndices =  which(ArrayOfPPVsWithGoodSensitivity == BestValue)
+        BestLinearIndices = ThirdLinearIndices[FourthLinearIndices] 
+        ##----------------------------------------------------------------------
+        ## Converting the linear indices into coordinates:
+        NumberOfBestHPSets = length(BestLinearIndices)
+        print(NumberOfBestHPSets)
+        InitialBestCoords = matrix(0,NumberOfBestHPSets,3) 
+        for (f in 1:NumberOfBestHPSets) { 
+          LinearIndex = BestLinearIndices[f]
+          if (NumberOfBestHPSets == 1) {
+            InitialBestCoords = which(TranslationTensor == LinearIndex, arr.ind = TRUE)
+          } else {
+            InitialBestCoords[f,] = which(TranslationTensor == LinearIndex, arr.ind = TRUE)
+          }
+        }
+        if (length(InitialBestCoords) <= 4) {
+          BestCoords = InitialBestCoords
+        } else {
+          ## If there are multiple parameter sets, we just use the first one:
+          BestCoords = InitialBestCoords[1,]  
+        }
+        
+      } else {
+      
+        ## It's possible there are multiple hyperparameter sets that give the best value of the
+        ## performance metric we're interested in. I just take the first hyperparameter set
+        ## because it doesn't matter which we use. That's why I write InitialBestCoords[1,] here.
+        ## And the coordinates for the CutOff of 0.5 is given by CutOffIndicesToUse:
+        if (length(CutOffIndicesToUse) == 1) {
+          if (length(InitialBestCoords) < 3) { 
+          BestCoords = c(InitialBestCoords, CutOffIndicesToUse)
+          } else { 
+          BestCoords = c(InitialBestCoords[1,], CutOffIndicesToUse)
+          } 
+          InitialBestCoordsList[[o]] = InitialBestCoords
+        } else {
+          ## I include this else option in case you ever want to 
+          ## try different cut offs when optimizing F1.
+          if (length(InitialBestCoords) < 4) { 
+            BestCoords = InitialBestCoords
+          } else { 
+            BestCoords = InitialBestCoords[1,]
+          } 
+          }
+        }
+    
+  }
+ 
+  ##----------------------------------------------------------------------------
+  ## Obtaining the values of the performance metrics for the best hyperparameter set 
+  ## (i.e. the performance metrics for the best coordinates in parameter space).
+  ## These are the mean performance metrics for inner cross validation. (Of course, 
+  ## when we then use the same hyperparameter set for outer cross validation, the 
+  ## performance metrics might be slightly worse):
+  
+  I1 = as.numeric(BestCoords[1])
+  I2 = as.numeric(BestCoords[2])
+  I3 = as.numeric(BestCoords[3])
+  
+  MeanF1Tensor = MeanF1TOC[,UIndicesToUse,o, ]
+  BestF1Object = MeanF1Tensor[I1,I2,I3]
+  BestF1 = BestF1Object[1]
+  StdF1Tensor = StdF1TOC[,UIndicesToUse,o, ]
+  BestF1StdErrObject = StdF1Tensor[I1,I2,I3] / sqrt(k)
+  BestF1StdErr = BestF1StdErrObject[1]
+  
+  MeanAccuracyTensor = MeanAccuracyTOC[,UIndicesToUse,o, ]
+  BestAccuracyObject = MeanAccuracyTensor[I1,I2,I3]
+  BestAccuracy = BestAccuracyObject[1]
+  StdAccuracyTensor = StdAccuracyTOC[,UIndicesToUse,o, ]
+  BestAccuracyStdErrObject = StdAccuracyTensor[I1,I2,I3] / sqrt(k)
+  BestAccuracyStdErr = BestAccuracyStdErrObject[1]
+  
+  MeanSensitivityTensor = MeanSensitivityTOC[,UIndicesToUse,o, ]
+  BestSensitivityObject = MeanSensitivityTensor[I1,I2,I3]
+  BestSensitivity = BestSensitivityObject[1]
+  StdSensitivityTensor = StdSensitivityTOC[,UIndicesToUse,o, ]
+  BestSensitivityStdErrObject = StdSensitivityTensor[I1,I2,I3] / sqrt(k)
+  BestSensitivityStdErr = BestSensitivityStdErrObject[1]
+  
+  MeanSpecificityTensor = MeanSpecificityTOC[,UIndicesToUse,o, ]
+  BestSpecificityObject = MeanSpecificityTensor[I1,I2,I3]
+  BestSpecificity = BestSpecificityObject[1]
+  StdSpecificityTensor = StdSpecificityTOC[,UIndicesToUse,o, ]
+  BestSpecificityStdErrObject = StdSpecificityTensor[I1,I2,I3] / sqrt(k)
+  BestSpecificityStdErr = BestSpecificityStdErrObject[1]
+
+  MeanAUCTensor = MeanAUCTOC[,UIndicesToUse,o]
+  BestAUCObject = MeanAUCTensor[I1,I2]
+  BestAUC = BestAUCObject[1]
+  
+  ## The following are the performance metrics for inner cross validation. Looking at this isn't
+  ## really important. What is important is looking at the performance metrics of 
+  ## outer cross validation, which is stored in FinalResultsAOCDF.
+  InnerCVResultsDF = data.frame('MeanEstimate' = c(BestF1, BestAccuracy, BestSensitivity, BestSpecificity),
+                           'StandardError' = c(BestF1StdErr, BestAccuracyStdErr,
+                                               BestSensitivityStdErr,
+                                               BestSpecificityStdErr))
+  rownames(InnerCVResultsDF) = c('F1', 'Accuracy', 'Sensitivity', 'Specificity')
+  colnames(InnerCVResultsDF) = c('Mean Estimate', 'Standard Error')
+  print(InnerCVResultsDF)
+  ##-----------------------------------------------------------------------------
+
+  InnerCVMeanAccuracyArray[o] = BestAccuracy
+  InnerCVAUCArray[o] = BestAUC
+  
+  ## Obtaining the best hyperparameters:
+    BestLambdaNumber = BestCoords[1]
+    if (length(UIndicesToUse) > 1) {
+      BestU = UArray[BestCoords[2]]
+    } else {
+      BestU = UArray[UIndicesToUse] 
+    }
+    
+    if (length(UIndicesToUse) > 1) {
+      BestCutOff = CutOffVector[BestCoords[3]]
+    } else {
+      BestCutOff = CutOffVector[BestCoords[2]]
+    }
+    ## Note: If there's more than one best hyperparameter set 
+    ## (i.e. more than one row of InitialBestCoords):
+    ## If VariedCutOffOption = 0 then we had just arbitrarily selected
+    ## the first row of the InitialBestCoords object to be BestCoords.  
+    ## If VariedCutOffOption = 1, then BestCoords came from
+    ## the process of choosing the best PPV or NPV.
+    
+    ## Now we store the best hyperparameter sets in the HPMatrix just so we can see what they are:
+    HPMatrix[o,'LambdaNumber'] = BestLambdaNumber
+    HPMatrix[o,'CutOff'] = BestCutOff
+    if (VariedCutOffOption == 1) {
+      HPMatrix[o,'CutOff'] = BestNewCutOff
+    }
+    HPMatrix[o,'NumberOfRNAs'] = BestU
+
+    ## If there is only one best hyperparameter set, then InitialBestCoordinates will
+    ## be a one-dimensional array. But I want to make R consider it 2 dimensional so that 
+    ## I can access the elements in the same way regardless of whether it is 1D or 2D
+    ## (which will be important a dozen lines down from here).
+    ## Therefore, I run the following line to make R consider it 2D, which is triggered if 
+    ## there are fewer than 4 elements in InitialBestCoordinates (4 elements because if there 
+    ## are 3 elements then it is a 1 by 3 array and therefore it is 1D, not 2D):
+    if (length(InitialBestCoords) < 4) {
+      InitialBestCoords = t(as.numeric(InitialBestCoords))
+    }
+    
+    ## If a lot of parameter sets give the best accuracy (or F1 or AUC), then we look at the range of
+    ## values for each hyperparameter that gives us the best accuracy (or F1 or AUC).
+    ## This probably gives us a sense of whether we've tried enough values
+    ## (i.e. if we have multiple values of alpha that work equally well, then
+    ## searching in even more detail in parameter space isn't going to improve
+    ## the performance of our model).
+    BestLambdaNumbers = InitialBestCoords[,1]
+    if (length(UIndicesToUse) > 1) {
+      BestUs = UArray[InitialBestCoords[,2]]
+    } else {
+      BestUs = rep(UArray[UIndicesToUse], 1, length(BestLambdaNumbers))
+    }
+
+    HPMatrix[o,'LambdaNumber B'] = min(BestLambdaNumbers)
+    HPMatrix[o,'LambdaNumber T'] = max(BestLambdaNumbers)
+    HPMatrix[o,'NumberOfRNAs B'] = min(BestUs)
+    HPMatrix[o,'NumberOfRNAs T'] = max(BestUs)
+}
+
+print(HPMatrix)
+
+```
+
+
+## Determining the final performance metrics from the outer loop of cross validation:
+
+```{r}
+
+## These matrices will serve as a record of the performance metrics for each fold of outer cross validation:
+F1Record = matrix(0,1,k)
+AccuracyRecord = matrix(0,1,k)
+SensitivityRecord = matrix(0,1,k)
+SpecificityRecord = matrix(0,1,k)
+PPVRecord = matrix(0,1,k)
+NPVRecord = matrix(0,1,k)
+NumberOfRNAsUsedArray = matrix(0,1,k)
+
+## This initializes the PredictedResponseVector, which will contain the predictions from all folds of outer cross validation:
+PredictedResponseVector = c()
+
+## This initializes the variables storing how many true positives, false positives etc. we get across all folds of outer cross validation. AOC stands for All Outer Cross validation:
+TruePosAOC = 0
+TrueNegAOC = 0
+FalsePosAOC = 0
+FalseNegAOC = 0
+
+EvenlyResortedAges = c()
+
+## This records whether the individual was correctly predicted or not:
+TruthArray = c() 
+
+##------------------------------------------------------------------------------
+## Now we determine the performance of the model on the test set:
+##------------------------------------------------------------------------------
+if (CrossValidationOption == 1) {
+  
+for (o in FoldsToOptimize) { 
+  
+  TestingResponseVector = FinalResponseVector[SubsetIndices[[o]]]
+  NumOfPeopleForTesting = length(TestingResponseVector)
+  TrainingResponseVector = FinalResponseVector[ -SubsetIndices[[o]] ]
+  NumOfPeopleForTraining = length(TrainingResponseVector)
+
+  ##============================================================================
+  ## This is included to look at the ages of individuals:
+  ## (OCV stands for Outer Cross Validation)
+  OCVBarcodes = EvenlyReorderedBarcodes[SubsetIndices[[o]]]
+  OCVAges = c()
+  for (h in 1:length(OCVBarcodes)){
+    MyBarcode = OCVBarcodes[h]
+    ## This is for actual TB:
+    if (TestingResponseVector[h] == 1) {
+      MyIndex = which(AgeOfTBDiagnosisDF[,'Barcode'] == MyBarcode)
+      OCVAges[h] = AgeOfTBDiagnosisDF[MyIndex,'Age']
+    ## This is for actual non-TB progressors:
+    } else if (TestingResponseVector[h] == 0) {
+      OCVAges[h] = AgeOfTSTConversionDF[MyBarcode,'Age']
+    }
+  }
+  ##============================================================================
+  
+  CorrectedCountsMatrix = CountsMatrixList[[o]]
+  NumberOfInputRNAs = HPMatrix[o,'NumberOfRNAs']
+  
+  ## The CorrectedCountsMatrix was essentially the concatenation of the Training Counts Matrix
+  ## (i.e. training and validation data) and the Testing Counts Matrix, so here 
+  ## I divide it up into its component counts matrices. 
+  ## Also, I will only include the top RNAs up until the NumberOfInputRNAs:
+  AllInputRNANamesOrdered = InputRNANamesOrderedList[[o]] 
+  
+  TrainingCountsMatrix = 
+    CorrectedCountsMatrix[AllInputRNANamesOrdered[1:NumberOfInputRNAs],1:NumOfPeopleForTraining]
+  TestingCountsMatrix = 
+    CorrectedCountsMatrix[ AllInputRNANamesOrdered[1:NumberOfInputRNAs],
+                           ((NumOfPeopleForTraining+1):NumberOfKidsOfInterest) ]
+  
+  
+  YDataForFitting = TrainingResponseVector
+  YDataForPredicting = TestingResponseVector
+  
+  fit1 = glmnet(t(TrainingCountsMatrix), as.factor(YDataForFitting), family="binomial", 
+              alpha = 1, nlambda=NumberOfLambdas, 
+              lambda.min.ratio =  MinimumLambdaRatio)
+  LambdaNum = HPMatrix[o,'LambdaNumber'] 
+  FitCoeffs = coef(fit1, s = fit1$lambda[LambdaNum]) 
+  PredictedYData = predict(fit1, newx = t(TestingCountsMatrix), s = fit1$lambda[LambdaNum],
+                               type = "response")
+
+  NumberOfRNAsUsedArray[o] = length(FitCoeffs@x)-1
+  
+  PredictedResponseVector = c(PredictedResponseVector, PredictedYData)
+
+  if (CutOffBackToOneHalfOption == 1) {
+    CutOff = 0.5
+  } else {
+    CutOff = HPMatrix[o,'CutOff']
+  }
+  
+  
+  TruePos = 0
+  TrueNeg = 0
+  FalsePos = 0
+  FalseNeg = 0
+  OCVTruths = c()
+  for (PersonNum in 1:length(PredictedYData)) { 
+      if (YDataForPredicting[PersonNum] > CutOff & PredictedYData[PersonNum] > CutOff) {
+          TruePos = TruePos + 1
+          TruePosAOC = TruePosAOC + 1
+          OCVTruths[PersonNum] = 1
+      } else if (YDataForPredicting[PersonNum] > CutOff & PredictedYData[PersonNum] < CutOff) {
+          FalseNeg = FalseNeg + 1
+          FalseNegAOC = FalseNegAOC + 1
+          OCVTruths[PersonNum] = 0
+      } else if (YDataForPredicting[PersonNum] < CutOff & PredictedYData[PersonNum] > CutOff) {
+          FalsePos = FalsePos + 1
+          FalsePosAOC = FalsePosAOC + 1
+          OCVTruths[PersonNum] = 0
+      } else if (YDataForPredicting[PersonNum] < CutOff & PredictedYData[PersonNum] < CutOff) {
+          TrueNeg = TrueNeg + 1
+          TrueNegAOC = TrueNegAOC + 1
+          OCVTruths[PersonNum] = 1
+        }
+    }
+      
+    ## We calculate the performance metrics for this fold of outer cross validation:
+    Accuracy = (TrueNeg + TruePos)/(TrueNeg + TruePos + FalseNeg + FalsePos)
+    Sensitivity = TruePos/(TruePos + FalseNeg)
+    Specificity = TrueNeg/(TrueNeg + FalsePos)
+    PPV = TruePos/(TruePos + FalsePos)
+    F1 = 2*PPV*Sensitivity/(PPV + Sensitivity)
+    NPV =  TrueNeg/(TrueNeg + FalseNeg)
+        
+    F1Record[o] = F1
+    AccuracyRecord[o] = Accuracy
+    SensitivityRecord[o] = Sensitivity
+    SpecificityRecord[o] = Specificity
+    PPVRecord[o] = PPV
+    NPVRecord[o] = NPV
+    
+    
+    EvenlyResortedAges = c(EvenlyResortedAges, OCVAges)
+    TruthArray = c(TruthArray, OCVTruths)  
+  }
+    
+
+##------------------------------------------------------------------------------
+## Getting the AUC and then using the ggroc command to plot the receiver operating characteristic curve:
+
+ROC_Object = roc(FinalResponseVector[1:length(PredictedResponseVector)],as.numeric(PredictedResponseVector), quiet = TRUE)
+FinalAUCValue = as.numeric(auc(ROC_Object))
+FinalAUCValueCI = ci.auc(ROC_Object, method = "bootstrap")
+ggroc(ROC_Object)
+
+
+##-------------------------------------------------------------------------------
+## Now we calculate the performance metrics for all folds of outer cross validation together (essentially this is the average across all folds):
+
+AccuracyAOC = (TrueNegAOC + TruePosAOC)/(TrueNegAOC + TruePosAOC + FalseNegAOC + FalsePosAOC)
+SensitivityAOC = TruePosAOC/(TruePosAOC + FalseNegAOC)
+SpecificityAOC = TrueNegAOC/(TrueNegAOC + FalsePosAOC)
+PPVAOC = TruePosAOC/(TruePosAOC + FalsePosAOC)
+F1AOC = 2*PPVAOC*SensitivityAOC/(PPVAOC + SensitivityAOC)
+PPVAOC =  TruePosAOC/(TruePosAOC + FalsePosAOC)
+NPVAOC =  TrueNegAOC/(TrueNegAOC + FalseNegAOC)
+
+##------------------------------------------------------------------------------
+## We bootstrap confidence intervals for the performance metrics.
+## What this is doing is seeing given the sample size, how much error is there
+## in the estimates of the performance metrics:
+##------------------------------------------------------------------------------
+BootstrapArray = c(rep(1,TruePosAOC), rep(2,TrueNegAOC), rep(3,FalsePosAOC), rep(4,FalseNegAOC))
+
+## The S in the following objects stands for Sampled (since these aren't the actual values
+## but rather are the values obtained by chance sampling by the bootstrapping simulation):
+AccuracySVector= matrix(0,1,NumberOfBootstrapTrials)
+SensitivitySVector= matrix(0,1,NumberOfBootstrapTrials)
+SpecificitySVector= matrix(0,1,NumberOfBootstrapTrials)
+PPVSVector= matrix(0,1,NumberOfBootstrapTrials)
+F1SVector= matrix(0,1,NumberOfBootstrapTrials)
+PPVSVector= matrix(0,1,NumberOfBootstrapTrials)
+NPVSVector= matrix(0,1,NumberOfBootstrapTrials)
+
+for (q in 1:NumberOfBootstrapTrials) {
+  SampledArray = sample(BootstrapArray, NumberOfKidsOfInterest, replace = TRUE)
+  TruePosS = length(which(SampledArray == 1))
+  TrueNegS = length(which(SampledArray == 2))
+  FalsePosS = length(which(SampledArray == 3))
+  FalseNegS = length(which(SampledArray == 4))
+  
+  AccuracyS = (TrueNegS + TruePosS) / (TrueNegS + TruePosS + FalseNegS + FalsePosS)
+  SensitivityS = TruePosS / (TruePosS + FalseNegS)
+  SpecificityS = TrueNegS / (TrueNegS + FalsePosS)
+  PPVS = TruePosS / (TruePosS + FalsePosS)
+  F1S = 2 * PPVS * SensitivityS / (PPVS + SensitivityS)
+  PPVS =  TruePosS / (TruePosS + FalsePosS)
+  NPVS =  TrueNegS / (TrueNegS + FalseNegS)
+  
+  AccuracySVector[q] = AccuracyS
+  SensitivitySVector[q] = SensitivityS
+  SpecificitySVector[q] = SpecificityS
+  PPVSVector[q] = PPVS
+  F1SVector[q] = F1S
+  PPVSVector[q] =  PPVS
+  NPVSVector[q] =  NPVS
+}
+
+## Now we compute the standard errors:
+AccuracySStdErr = sd(AccuracySVector)  
+## If there are NA entries, you could do: AccuracySStdErr = sd(AccuracySVector, na.rm = TRUE)
+SensitivitySStdErr = sd(SensitivitySVector)
+SpecificitySStdErr = sd(SpecificitySVector)
+PPVSStdErr =  sd(PPVSVector)
+F1SStdErr = sd(F1SVector)
+NPVSStdErr =  sd(NPVSVector)
+
+## And now we compute the 95% confidence intervals:
+OrderedF1SVector = sort(F1SVector)
+F1SNFCITop = OrderedF1SVector[round(0.975*NumberOfBootstrapTrials)]
+F1SNFCIBottom = OrderedF1SVector[round(0.025*NumberOfBootstrapTrials)]
+
+OrderedAccuracySVector = sort(AccuracySVector)
+AccuracySNFCITop = OrderedAccuracySVector[round(0.975*NumberOfBootstrapTrials)]
+AccuracySNFCIBottom = OrderedAccuracySVector[round(0.025*NumberOfBootstrapTrials)]
+
+OrderedSensitivitySVector = sort(SensitivitySVector)
+SensitivitySNFCITop = OrderedSensitivitySVector[round(0.975*NumberOfBootstrapTrials)]
+SensitivitySNFCIBottom = OrderedSensitivitySVector[round(0.025*NumberOfBootstrapTrials)]
+
+OrderedSpecificitySVector = sort(SpecificitySVector)
+SpecificitySNFCITop = OrderedSpecificitySVector[round(0.975*NumberOfBootstrapTrials)]
+SpecificitySNFCIBottom = OrderedSpecificitySVector[round(0.025*NumberOfBootstrapTrials)]
+
+OrderedPPVSVector = sort(PPVSVector)
+PPVSNFCITop = OrderedPPVSVector[round(0.975*NumberOfBootstrapTrials)]
+PPVSNFCIBottom = OrderedPPVSVector[round(0.025*NumberOfBootstrapTrials)]
+
+OrderedNPVSVector = sort(NPVSVector)
+NPVSNFCITop = OrderedNPVSVector[round(0.975*NumberOfBootstrapTrials)]
+NPVSNFCIBottom = OrderedNPVSVector[round(0.025*NumberOfBootstrapTrials)]
+
+FinalResultsAOCDF = data.frame('Measures' = c(F1AOC, AccuracyAOC,
+                                               SensitivityAOC, SpecificityAOC,
+                                               PPVAOC, NPVAOC), 
+                               'StandardError' = c(F1SStdErr, AccuracySStdErr,
+                                               SensitivitySStdErr, SpecificitySStdErr,
+                                               PPVSStdErr, NPVSStdErr),
+                               'Bottom of 95% CI' = c(F1SNFCIBottom, AccuracySNFCIBottom,
+                                               SensitivitySNFCIBottom, SpecificitySNFCIBottom,
+                                               PPVSNFCIBottom, NPVSNFCIBottom),
+                               'Top of 95% CI' = c(F1SNFCITop, AccuracySNFCITop,
+                                               SensitivitySNFCITop, SpecificitySNFCITop,
+                                               PPVSNFCITop, NPVSNFCITop)
+                               )
+rownames(FinalResultsAOCDF) = c('F1', 'Accuracy', 'Sensitivity', 'Specificity', 'PPV', 'NPV')
+print(FinalResultsAOCDF)
+
+}
+
+```
+
+
+## Seeing whether the performance of the predictive model changes with the age at which infection occurs:
+
+```{r}
+
+AgeMins = c(0,2)
+AgeMaxes = c(2,12)
+AccuracyTimeline = c(0,0)
+AUCTimeline = c(0,0)
+
+FinalResponseVectorToUse = FinalResponseVector[1:length(PredictedResponseVector)]
+
+for (h in 1:length(AgeMins)) {
+  CurrentAgeIndices = which(EvenlyResortedAges >= AgeMins[h] & EvenlyResortedAges < AgeMaxes[h])
+  
+  Accuracy = sum(TruthArray[CurrentAgeIndices])/length(CurrentAgeIndices)
+  AccuracyTimeline[h] = Accuracy
+  
+  CurrentFinalResponseVector = FinalResponseVectorToUse[CurrentAgeIndices]
+  CurrentPredictedResponseVector = PredictedResponseVector[CurrentAgeIndices]
+  
+  CurrentROC_Object = roc(CurrentFinalResponseVector,CurrentPredictedResponseVector, quiet = TRUE)
+  if (h == 1) {
+    ROC_Object1 = CurrentROC_Object
+  } else if (h == 2) {
+    ROC_Object2 = CurrentROC_Object
+  }
+  CurrentAUCValue = as.numeric(auc(CurrentROC_Object))
+  CurrentAUCValueCI = ci.auc(CurrentROC_Object, method = "bootstrap")
+  ggroc(CurrentROC_Object)
+  
+  print(CurrentAUCValue)
+  print(CurrentAUCValueCI)
+}
+
+roc.test(ROC_Object1, ROC_Object2, method="delong")
+
+```
+
+
+## This is if you only ran inner cross validation and now you want to fit the model on all the data
+## to obtain the model coefficients:
+
+```{r}
+if (CrossValidationOption == 2) {
+
+  o = 1
+  
+  TrainingResponseVector = FinalResponseVector
+  NumOfPeopleForTraining = length(TrainingResponseVector)
+
+  CorrectedCountsMatrix = CountsMatrixList[[o]]
+  NumberOfInputRNAs = HPMatrix[o,'NumberOfRNAs']
+  ## The CorrectedCountsMatrix was essentially the concatination of the Training (i.e. NonTesting) and 
+  ## the Testing Counts Matrix, so here I divide it up into its component counts matrices. 
+  ## Also, I only include the top RNAs up until the NumberOfInputRNAs:
+  AllInputRNANamesOrdered = InputRNANamesOrderedList[[o]] 
+  TrainingCountsMatrix = CorrectedCountsMatrix[AllInputRNANamesOrdered[1:NumberOfInputRNAs],1:NumOfPeopleForTraining]
+
+  ##----------------------------------------------------------------------------
+
+  fit1 = glmnet(t(TrainingCountsMatrix), as.factor(TrainingResponseVector), family="binomial", 
+              alpha = 1, nlambda=NumberOfLambdas, 
+              lambda.min.ratio =  MinimumLambdaRatio)
+        
+  LambdaNum = HPMatrix[o,'LambdaNumber'] 
+  FitCoeffs = coef(fit1, s = fit1$lambda[LambdaNum]) 
+  # PredictedYData = predict(fit1, newx = t(TestingCountsMatrix), s = fit1$lambda[LambdaNum], type = "response")
+  
+  RNANamesTried = AllInputRNANamesOrdered[1:NumberOfInputRNAs]
+  RNANamesUsed = RNANamesTried[FitCoeffs@i[-1]]  
+  NumberOfRNAsUsed = length(RNANamesUsed)
+  
+  ##---------------------------
+  ## Computing the weights of the RNAs in the model:
+  UsedRNAWeights = matrix(0,NumberOfRNAsUsed,1)
+  for (w in 1:NumberOfRNAsUsed) {
+    ## The "1+" is there because FitCoeffs starts with the intercept term.
+    UsedRNAWeights[w] = FitCoeffs@x[1+w]*sd(CorrectedCountsMatrix[RNANamesUsed[w],])
+  }
+  
+  ModelCoefficients = FitCoeffs@x[2:NumberOfRNAsUsed]
+  
+  ##---------------------------
+  ## Getting the gene names instead of the Ensemble IDs:
+  
+  library(clusterProfiler)
+
+  MyEnsIDs = rownames(UsedRNAsCaseVsControlResultsDF)
+
+  ## LR stands for Logistic Regression:
+  UsedRNAWeightsTable = cbind(MyEnsIDs,UsedRNAWeights,abs(UsedRNAWeights),ModelCoefficients)
+  colnames(UsedRNAWeightsTable) = c("ENSEMBL", "Weight", "|Weight|", "Coefficient")
+
+  MyFullNames = bitr(MyEnsIDs, fromType="ENSEMBL", toType=c("SYMBOL", "GENENAME"), OrgDb="org.Hs.eg.db")
+  UsedRNAWeightsAndNamesTable = merge(UsedRNAWeightsTable,MyFullNames,by="ENSEMBL",all.x=TRUE)
+  
+  print("Intercept")
+  print(FitCoeffs@x[1])
+  ##--------------------------
+}
+```
+
