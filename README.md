@@ -15,5 +15,5 @@ This folder contains the pipeline to perform our differential expression analysi
 
 3)	Data
 
-This folder contains all data needed to run the above analyses.
+This folder contains all data needed to run the above analyses, except RNA expression count matrices.
 
