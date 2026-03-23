@@ -1,7 +1,7 @@
 # TBRNA2025
 Scripts for "Host RNA biomarkers in cord blood predict Mycobacterium tuberculosis infection or TB disease during childhood"
 
-Prior to using these scripts, please first refer to the Supplementary Methods for our paper. 
+Prior to using these scripts, please first refer to the Methods and Supplementary Methods for our paper. 
 
 To run the same analyses as performed in our paper, refer to the Read Me files in each subfolder. The subfolders are:
 
@@ -11,7 +11,7 @@ This folder contains the scripts for the model that predicts whether children wi
 
 2)	DifferentialExpressionAnalysisPipeline
 
-This folder contains the pipeline to perform our differential expression analysis methodology as well as the logistic regression that computes relative risk estimates.
+This folder contains the pipeline to perform our differential expression analysis methodology.
 
 3)	Data
 
