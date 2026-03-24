@@ -1,0 +1,221 @@
+---
+title: "GSEA"
+author: "Gabriel Bronk"
+date: "2025-07-30"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## CHANGE THE FOLDER NAME:
+FolderName = 'InfectedVsUninfected'
+
+## CHANGE THIS FILE PATH:
+SavingPrefix = paste('c:/Users/gbron/OneDrive - Mass General Brigham/Documents/AKlengelLab/R01Project/InfectiousDisease/TableGSEA', FolderName,sep="")
+
+MyDirectory = paste('c:/Users/gbron/OneDrive - Mass General Brigham/Documents/AKlengelLab/R01Project/InfectiousDisease/', FolderName, sep="")
+knitr::opts_knit$set(root.dir = MyDirectory)
+```
+
+
+```{r}
+library(msigdbr)
+library(fgsea)
+library(data.table)
+library(magrittr)
+library(ggplot2)
+library(clusterProfiler)
+
+## LOADING UP THE DIFFERENTIAL EXPRESSION RESULTS IN ORDER TO INPUT IT INTO GSEA:
+DEGFileName = paste(FolderName,'OutputStep3.RData',sep="")
+load(DEGFileName)
+
+```
+
+
+```{r}
+
+##------------------------------------------------------------------------------
+## Loading the DE Analysis results:
+##------------------------------------------------------------------------------
+
+
+df = ResultsDF
+rankings <- sign(df$log2FoldChange)*(-log10(df$pvalue))
+names(rankings) <- rownames(df)
+
+# Some genes have such low p values that the signed pval is +- inf, we need to change it to the maximum * constant to avoid problems with fgsea
+max_ranking <- max(rankings[is.finite(rankings)])
+min_ranking <- min(rankings[is.finite(rankings)])
+rankings <- replace(rankings, rankings > max_ranking, max_ranking * 10)
+rankings <- replace(rankings, rankings < min_ranking, min_ranking * 10)
+rankings <- sort(rankings, decreasing = TRUE) # sort genes by ranking
+
+
+##------------------------------------------------------------------------------
+## GO Biological Processes
+##------------------------------------------------------------------------------
+
+gene_sets_df = msigdbr(
+  db_species = "HS",
+  species = "human",
+  collection = "C5",
+  subcollection = "GO:BP" )
+
+# Converting to named list format required by fgsea:
+gene_sets <- gene_sets_df %>% split(x = .$ensembl_gene, f = .$gs_name)
+
+
+GseaBP <- fgsea(pathways = gene_sets, 
+                 stats = rankings,
+                 scoreType = 'std',  
+                 minSize = 10, 
+                 maxSize = 1000, 
+                 nproc = 1) 
+
+CollapsedPathwaysBP = collapsePathways(GseaBP[order(padj)][padj<0.05],gene_sets,rankings)
+MainPathwaysBP <- GseaBP[pathway %in% CollapsedPathwaysBP$mainPathways][order(-NES), pathway]
+
+Logicals = (as.character(GseaBP$pathway) %in% as.character(MainPathwaysBP))
+Inds = which(Logicals == TRUE)
+## MP stands for Main Pathways:
+GseaBPMP = GseaBP[Inds,]
+
+
+##------------------------------------------------------------------------------
+## GO Cell Components
+##------------------------------------------------------------------------------
+
+gene_sets_df = msigdbr(
+  db_species = "HS",
+  species = "human",
+  collection = "C5",
+  subcollection = "GO:CC" )
+
+# Converting to named list format required by fgsea
+gene_sets <- gene_sets_df %>% split(x = .$ensembl_gene, f = .$gs_name)
+
+
+GseaCC <- fgsea(pathways = gene_sets, 
+                 stats = rankings,
+                 scoreType = 
+                 minSize = 10,  
+                 maxSize = 1000, 
+                 nproc = 1) 
+
+CollapsedPathwaysCC = collapsePathways(GseaCC[order(padj)][padj<0.05],gene_sets,rankings)
+MainPathwaysCC <- GseaCC[pathway %in% CollapsedPathwaysCC$mainPathways][order(-NES), pathway]
+
+Logicals = (as.character(GseaCC$pathway) %in% as.character(MainPathwaysCC))
+Inds = which(Logicals == TRUE)
+## MP stands for Main Pathways:
+GseaCCMP = GseaCC[Inds,]
+
+
+##------------------------------------------------------------------------------
+## GO Molecular Functions
+##------------------------------------------------------------------------------
+
+gene_sets_df = msigdbr(
+  db_species = "HS",
+  species = "human",
+  collection = "C5",
+  subcollection = "GO:MF" )
+
+# Converting to named list format required by fgsea
+gene_sets <- gene_sets_df %>% split(x = .$ensembl_gene, f = .$gs_name)
+
+
+GseaMF <- fgsea(pathways = gene_sets, 
+                 stats = rankings,
+                 scoreType =  
+                 minSize = 10,  
+                 maxSize = 1000, 
+                 nproc = 1) 
+
+CollapsedPathwaysMF = collapsePathways(GseaMF[order(padj)][padj<0.05],gene_sets,rankings)
+MainPathwaysMF <- GseaMF[pathway %in% CollapsedPathwaysMF$mainPathways][order(-NES), pathway]
+
+Logicals = (as.character(GseaMF$pathway) %in% as.character(MainPathwaysMF))
+Inds = which(Logicals == TRUE)
+## MP stands for Main Pathways:
+GseaMFMP = GseaMF[Inds,]
+
+```
+
+## For saving:
+
+```{r}
+
+OrderedIndices = order(GseaBPMP$padj)
+GseaBPToSave = as.data.frame(GseaBPMP[OrderedIndices, c(1:3,6,7)])
+## Making the right number of significant figures:
+for (q in 2:4) {
+  GseaBPToSave[,q] =  formatC(GseaBPToSave[,q], digits = 2, format = "fg", flag = "#") 
+}
+
+OrderedIndices = order(GseaMFMP$padj)
+GseaMFToSave = as.data.frame(GseaMFMP[OrderedIndices, c(1:3,6,7)])
+## Making the right number of significant figures:
+for (q in 2:4) {
+  GseaMFToSave[,q] =  formatC(GseaMFToSave[,q], digits = 2, format = "fg", flag = "#") 
+}
+
+OrderedIndices = order(GseaCCMP$padj)
+GseaCCToSave = as.data.frame(GseaCCMP[OrderedIndices, c(1:3,6,7)])
+## Making the right number of significant figures:
+for (q in 2:4) {
+  GseaCCToSave[,q] =  formatC(GseaCCToSave[,q], digits = 2, format = "fg", flag = "#") 
+}
+
+
+# BiologicalProcess
+SavingFileName = paste(SavingPrefix, 'A', '.csv', sep="")
+write.csv(x=GseaBPToSave, file=SavingFileName)
+
+## Molecular Function
+SavingFileName = paste(SavingPrefix, 'B', '.csv', sep="")
+write.csv(x=GseaMFToSave, file=SavingFileName)
+
+## Cellular Component
+SavingFileName = paste(SavingPrefix, 'C', '.csv', sep="")
+write.csv(x=GseaCCToSave, file=SavingFileName)
+
+
+
+
+
+```
+
+## For plotting:
+
+```{r}
+
+gse_df <- as.data.frame(GseaBPMP)
+gse_df$padj <- as.numeric(gse_df$padj)
+
+OrderedIndices = order(gse_df$padj)
+top_terms <- gse_df[OrderedIndices[1:5], ]  # adjust N as needed
+top_terms$Sign = as.character(round(top_terms$ES/abs(top_terms$ES)))
+
+ggplot(top_terms, aes(x = reorder(pathway, -log10(padj)),
+                      y = -log10(padj),
+                      fill = Sign)) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = c("1" = "indianred1", "-1" = "deepskyblue")) +
+  coord_flip() +
+  labs(x = "",
+       y = "-log10(p adj)") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  )
+
+
+```
+
+
+
