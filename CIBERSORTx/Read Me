@@ -1,2 +1,4 @@
 This folder estimates cell type proportions using CIBERSORTx. First, use the script ScriptPriorToCIBERSORTx.Rmd. Then run CIBERSORTx online at https://cibersortx.stanford.edu/  .
 Then use the script ScriptAfterCIBERSORTx.Rmd.
+
+CIBERSORTx_Results.csv is the raw results file we obtained for our data using the CIBERSORTx website. 
