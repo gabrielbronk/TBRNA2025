@@ -12,4 +12,4 @@ Some of these groups overlap - i.e. there are barcodes that fit into more than o
 
 In R, open AgesOfTSTConversionAndTBDiagnosis.RData to see the ages at which children were diagnosed with TB disease (see the object AgesOfTBDiagnosisDF). See the object AgeOfTSTConversionDF to see the ages at which children TST converted (note that if the age says 0, it indicates the child never TST converted).
 
-The other files in this folder contain the demographic/clinical covariates or technical covariates.
+The other files in this folder contain the demographic/clinical covariates or technical covariates. For example, Batches.csv shows which Extraction, Library and Sequencing batches each sample was processed in during RNA sequencing.
