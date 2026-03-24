@@ -13,7 +13,15 @@ This folder contains the scripts for the model that predicts whether children wi
 
 This folder contains the pipeline to perform our differential expression analysis methodology.
 
-3)	Data
+3) GSEA
 
-This folder contains all data needed to run the above analyses, except RNA expression count matrices.
+This folder contains the script for Gene Set Enrichment Analysis.
+
+4) CIBERSORTx
+
+This folder contains the scripts for cell type proportion estimation with CIBERSORTx.
+
+5)	Data
+
+This folder contains all data needed to run the above analyses.
 
