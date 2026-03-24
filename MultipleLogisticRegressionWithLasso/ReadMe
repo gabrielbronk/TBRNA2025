@@ -4,6 +4,6 @@ This folder performs logistic regression with lasso regularization. It uses tran
 
 To run the logistic regression with lasso regularization, start with “MultipleLogisticRegressionWithLasso.Rmd”, first making sure to set your desired options in "OptionsForMultipleLogisticRegression.R".
 
-If you run “MultipleLogisticRegressionWithLasso.Rmd” using parallel jobs, you will next need to run “CombiningOutputFilesFromMultipleLogisticRegression.Rmd” to combine the outputs of the parallel jobs into a single file. If you didn’t use parallel jobs, you can skip this.
+If you want to run “MultipleLogisticRegressionWithLasso.Rmd” using parallel jobs, you can see the file "ExampleSLURMScriptForParallelJobsOnComputerCluster.sh" - this is specifically for using the SLURM job scheduler on a computing cluster, though you will need to edit this according to your institution's computing cluster guidelines. After running parallel jobs, you will next need to run “CombiningOutputFilesFromMultipleLogisticRegression.Rmd” to combine the outputs of the parallel jobs into a single file. If you didn’t use parallel jobs, you can skip this.
 
 Finally, you will run “MultipleLogisticRegressionPerformanceEvaluation.Rmd”, which will tell you how well the model performed or the coefficients of the model.
