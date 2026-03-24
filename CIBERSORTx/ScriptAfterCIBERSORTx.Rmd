@@ -1,0 +1,159 @@
+---
+title: "Cibersortx After Script"
+author: "Gabriel Bronk"
+date: "2025-07-18"
+output: html_document
+---
+
+This script was run after running CIBERSORTx at https://cibersortx.stanford.edu/
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## Write your directory name here:
+MyDirectory = 'c:/Users/gbron/OneDrive - Mass General Brigham/Documents/AKlengelLab/R01Project/GitHubForTB/Data'
+
+knitr::opts_knit$set(root.dir = MyDirectory)
+```
+
+```{r}
+library('dplyr')
+library('mutoss')
+```
+
+
+
+```{r}
+
+load('BarcodesOfOutcomeGroups.RData')
+
+## Loading up the results from CIBERSORTx:
+CibersortMatrix = read.csv('c:/Users/gbron/OneDrive - Mass General Brigham/Documents/AKlengelLab/R01Project/InfectiousDisease/CellTypeDeconvolution/CIBERSORTx_Results.csv', header = TRUE)
+rownames(CibersortMatrix) = CibersortMatrix$Mixture
+
+##------------------------------------------------------------------------------
+## Grouping cell subtypes together into larger cell types:
+
+# B cells:
+BCells = rowSums(CibersortMatrix[,2:4]) 
+
+# CD8 T cells:
+CD8s = CibersortMatrix[,5]
+
+# CD4 T cells:
+CD4s = rowSums(CibersortMatrix[,c(6:8,10)]) 
+
+# NK Cells:
+NKs = rowSums(CibersortMatrix[,12:13])
+
+# Monocytes:
+Monocytes = CibersortMatrix[,14]
+
+#Macrophages:
+M0Macrophages = rowSums(CibersortMatrix[,15:17]) 
+
+# Dendritic cells:
+Dendritics = rowSums(CibersortMatrix[,18:19])
+
+# Mast cells:
+Masts = rowSums(CibersortMatrix[,20:21])
+
+# Neutrophils:
+Neutrophils = CibersortMatrix[,23]
+
+CellDF = data.frame('BCells' = BCells, 'CD8s' = CD8s, 'CD4s' = CD4s, 'NKs' = NKs, 'Monocytes' = Monocytes, 'Macrophages' = M0Macrophages, 'Dendritics' = Dendritics, 'Masts' = Masts, 'Neutrophils' = Neutrophils)
+
+rownames(CellDF) = CibersortMatrix$Mixture
+
+
+##------------------------------------------------------------------------------
+## Comparing cells from different disease groups:
+
+NumberOfCellTypes = dim(CellDF)[2]
+Results = matrix(0,5,NumberOfCellTypes)
+rownames(Results) = c('TB Progressors vs Mtb-Infected Non-Progressors',
+                       'Mtb-Infected Non-Progressors vs Uninfected Individuals',
+                       'TB Progressors vs Uninfected Individuals',
+                       'TB Progressors vs All Individuals without TB Disease',
+                       'All Mtb-Infected Individuals vs Uninfected Individuals')
+
+
+CellNames = c('B Cells', 'CD8 T Cells', 'CD4 T Cells', 'Natural Killer Cells', 'Monocytes', 'Macrophages', 'Dendritic Cells', 'Mast Cells', 'Neutrophils')
+colnames(Results) = CellNames
+
+
+for (i in 1:NumberOfCellTypes) {
+   Test = wilcox.test(CellDF[BarcodesOfTB,i], y = CellDF[BarcodesOfAINoIsoniazid,i], alternative = "two.sided")
+   Results[1,i] = Test$p.value
+  
+   Test = wilcox.test(CellDF[BarcodesOfAINoIsoniazid,i], y = CellDF[BarcodesOfNonInfected,i], alternative = "two.sided")
+   Results[2,i] = Test$p.value
+
+   Test = wilcox.test(CellDF[BarcodesOfTB,i], y = CellDF[BarcodesOfNonInfected,i], alternative = "two.sided")
+   Results[3,i] = Test$p.value
+
+   Test = wilcox.test(CellDF[BarcodesOfTB,i], y = CellDF[BarcodesOfNonDisease,i], alternative = "two.sided")
+   Results[4,i] = Test$p.value
+
+   Test = wilcox.test(CellDF[BarcodesOfInfectedOrTB,i], y = CellDF[BarcodesOfNonDisease,i], alternative = "two.sided")
+   Results[5,i] = Test$p.value
+
+}
+ResultsForPaper = formatC(Results, digits = 3, format = "fg", flag = "#") 
+
+AdjustedResults = Results
+for (i in 1:5) {
+   AdjustedObject = BL(Results[i,], 0.05, silent=FALSE)
+   AdjustedResults[i,] = AdjustedObject$adjPValues
+}
+AdjustedResultsForPaper = formatC(AdjustedResults, digits = 3, format = "fg", flag = "#") 
+
+
+##------------------------------------------------------------------------------
+
+MeanDF = matrix(0,5,NumberOfCellTypes)
+## Progressors
+## Infected Nonprogressors
+## All infected
+## Non-infected
+## No disease
+
+## Getting mean values:
+
+for (i in 1:NumberOfCellTypes) {
+  MeanDF[1,i] = mean(CellDF[BarcodesOfTB,i])
+  MeanDF[2,i] = mean(CellDF[BarcodesOfAINoIsoniazid,i])
+  MeanDF[4,i] = mean(CellDF[BarcodesOfInfectedOrTB,i])
+  MeanDF[3,i] = mean(CellDF[BarcodesOfNonInfected,i])
+  MeanDF[5,i] = mean(CellDF[BarcodesOfNonDisease,i])
+}
+MeanDFForPaper = formatC(MeanDF, digits = 3, format = "fg", flag = "#") 
+
+rownames(MeanDFForPaper) = c('TB Progressors', 'Mtb-Infected Non-Progressors', 'Uninfected Individuals', 'All Mtb-Infected Individuals', 'All Individuals without TB Disease')
+colnames(MeanDFForPaper) =  CellNames
+
+
+
+
+StdDF = matrix(0,5,NumberOfCellTypes)
+## Progressors
+## Infected Nonprogressors
+## All infected
+## Non-infected
+## No disease
+
+## Getting standard deviation values:
+
+for (i in 1:NumberOfCellTypes) {
+  StdDF[1,i] = sd(CellDF[BarcodesOfTB,i])
+  StdDF[2,i] = sd(CellDF[BarcodesOfAINoIsoniazid,i])
+  StdDF[4,i] = sd(CellDF[BarcodesOfInfectedOrTB,i])
+  StdDF[3,i] = sd(CellDF[BarcodesOfNonInfected,i])
+  StdDF[5,i] = sd(CellDF[BarcodesOfNonDisease,i])
+}
+StdDFForPaper = formatC(StdDF, digits = 3, format = "fg", flag = "#") 
+rownames(StdDFForPaper) = c('TB Progressors', 'Mtb-Infected Non-Progressors', 'Uninfected Individuals', 'All Mtb-Infected Individuals', 'All Individuals without TB Disease')
+colnames(StdDFForPaper) =  CellNames
+
+```

@@ -1,0 +1,395 @@
+---
+title: "Script Prior to CIBERSORTx"
+author: "Gabriel Bronk"
+date: "2025-07-14"
+output: html_document
+---
+
+This script was run prior to running CIBERSORTx at https://cibersortx.stanford.edu/
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+## Write your directory name here:
+MyDirectory = 'c:/Users/gbron/OneDrive - Mass General Brigham/Documents/AKlengelLab/R01Project/GitHubForTB/Data'
+
+knitr::opts_knit$set(root.dir = MyDirectory)
+```
+
+
+## Loading R packages:
+
+```{r}
+
+library(DESeq2)
+library(readxl)
+library(EDASeq)
+library(DGEobj.utils)
+library(edgeR)
+library(clusterProfiler)
+
+CountCorrectionOption = 0
+## Use 0 to use already corrected counts.
+## Use 1 to correct the counts (takes 1.5 hours).
+```
+
+
+## This section loads data and sets up the rest of the script:
+
+```{r}
+
+##------------------------------------------------------------------------------  
+## Creating the DESeq2 contrast and the design formula with technical variables:  
+##------------------------------------------------------------------------------  
+
+MyDesignFormula = as.formula("~ SequencingBatch + ExonicRate + IntergenicRate")
+CovariateArray = c('SequencingBatch', 'ExonicRate', 'IntergenicRate')
+NumberOfTechnicalVariablesBB = length(CovariateArray) - 1
+## This is the number of technical covariates not counting sequencing batch. BB stands for "Besides Batch"
+
+ContrastVariables = c("CaseOrControl",'B','A') 
+## These are the groups that will be compared in DESeq2. 
+## Because A is written last, A is the reference, so if we see an increase in 
+## expression, it means that B is expressed more than A.
+MyReferenceLevel = 'A'  
+
+
+##------------------------------------------------------------------------------
+## Loading the Count Matrix:
+##------------------------------------------------------------------------------
+
+LoadedCountMatrix = read.csv("RawCountMatrix.csv", header = FALSE)
+
+## Reformatting the count matrix:
+LoadedCountMatrixWithHeaders = LoadedCountMatrix[-1,]
+colnames(LoadedCountMatrixWithHeaders) = LoadedCountMatrix[1,]
+RawCountMatrix = LoadedCountMatrixWithHeaders[,-1]
+rownames(RawCountMatrix) = LoadedCountMatrixWithHeaders[,1]
+
+
+##------------------------------------------------------------------------------
+## Loading the Technical Covariates:
+##------------------------------------------------------------------------------
+
+## Here we load the values of the technical covariates. DF stands for Data Frame:
+RinDF = read.csv("RNAIntegrityNumbers.csv", header = TRUE)
+TechnicalDF = as.data.frame(read_excel('TechnicalCovariatesFromMultiQC.xlsx'))
+BatchDF = read.csv('Batches.csv')   
+rownames(BatchDF) = BatchDF[,1]
+BatchDF = BatchDF[,-1]
+
+## This section centers the RIN values because DESeq2 puts out a warning if you do not center them. 
+rownames(RinDF) = RinDF$Barcode
+RinDF$RIN = as.numeric(RinDF$RIN)
+MeanRIN = mean(RinDF$RIN)
+CenteredRINDF = RinDF
+CenteredRINDF$RIN = RinDF$RIN - MeanRIN
+
+## To avoid DESeq2 putting out a warning, we center and scale every technical covariate from the MultiQC tool:
+rownames(TechnicalDF) = TechnicalDF$Barcode
+## Column 20 is removed because the Average Read Lengths in column 20 are not correct:
+TechnicalDFReformatted = TechnicalDF[,-c(1,20)]
+FinalTechnicalDF = TechnicalDFReformatted
+NumberOfTechnicalVariables = dim(TechnicalDFReformatted)[2]
+## CN stands for Column Number:
+for (CN in 1:NumberOfTechnicalVariables){
+  ColumnMean = mean(TechnicalDFReformatted[,CN])
+  ColumnStdDev = sd(TechnicalDFReformatted[,CN])
+  FinalTechnicalDF[,CN] = ( TechnicalDFReformatted[,CN] - ColumnMean )/ColumnStdDev 
+}  
+
+
+##------------------------------------------------------------------------------
+## Loading the Barcodes that Correspond to Individuals:
+##------------------------------------------------------------------------------
+
+AllBarcodes = TechnicalDF$Barcode
+
+## This loads the barcodes of the individuals in in each outcome group. The outcome groups are:
+## -AINoIsoniazid, which is individuals who had positive tuberculin skin tests but did not progress to TB disease AND did not receive isoniazid. (AI stands for Asymptomatic Infected).
+## -NonInfected, which is individuals who did not have positive tuberculin skin tests.
+## -TB, which is individuals who contracted TB
+## -NonDisease, which is comprised of the AINoIsoniazid and NonInfected groups
+## -InfectedOrTB, which is individuals who had positive tuberculin skin tests and/or contracted TB disease. 
+load('BarcodesOfOutcomeGroups.RData')
+
+BarcodesOfTestKids = BarcodesOfInfectedOrTB
+BarcodesOfControlKids = BarcodesOfNonInfected
+
+NumberOfTestKids = length(BarcodesOfTestKids)
+NumberOfControlKids = length(BarcodesOfControlKids)
+NumberOfKidsOfInterest = NumberOfTestKids + NumberOfControlKids 
+
+## In correcting for technical variables, We use all 1815 samples - i.e. not just cord blood samples but also peripheral blood at later ages and from other individuals. Because these samples were all sequenced simultaneously, it helps us to control for the technical variables of sequencing. All the samples that are not the cord blood samples from test kids or the control kids are referred to as the BarcodesOfOtherSamples.
+LogicalsOfOtherSamples = AllBarcodes %in% c(BarcodesOfTestKids,BarcodesOfControlKids)
+IndicesOfOtherSamples = which(LogicalsOfOtherSamples == FALSE)
+BarcodesOfOtherSamples = AllBarcodes[IndicesOfOtherSamples]
+CurrentBarcodesToAnalyze = c(BarcodesOfTestKids,BarcodesOfControlKids,BarcodesOfOtherSamples)
+BarcodesOfTestAndControlKids = c(BarcodesOfTestKids,BarcodesOfControlKids)
+
+##------------------------------------------------------------------------------
+## Creating the Metadata Table:
+##------------------------------------------------------------------------------
+Metadata = data.frame('ExtractionBatch' =
+                        as.factor(BatchDF[CurrentBarcodesToAnalyze,'Extraction']))
+rownames(Metadata) = CurrentBarcodesToAnalyze
+Metadata[,'LibraryBatch'] = as.factor(BatchDF[CurrentBarcodesToAnalyze,'Library'])
+Metadata[,'SequencingBatch'] = as.factor(BatchDF[CurrentBarcodesToAnalyze,'Sequencing'])
+Metadata[,'RIN'] = CenteredRINDF[CurrentBarcodesToAnalyze,'RIN']
+Metadata = cbind(Metadata, FinalTechnicalDF[CurrentBarcodesToAnalyze,])
+
+ArrayOfCaseOrControl = c( rep('B',length(BarcodesOfTestKids)), rep('A',length(BarcodesOfControlKids)), rep('C',length(BarcodesOfOtherSamples)) )
+Metadata[,'CaseOrControl'] = as.factor(ArrayOfCaseOrControl)
+
+
+```
+
+
+## Normalizing the Count Matrix:
+
+```{r}
+
+## Here we normalize the counts matrix. Note that FinalTechnicalMatrix has no role in this normalization.
+## It's simply there as a place holder (because DESeq2 requires there to be an input for colData),
+## and FinalTechnicalMatrix has the order of barcodes the same as RawCountsMatrix, which I believe
+## is necessary.
+ddsForNormalization = DESeqDataSetFromMatrix(countData = RawCountMatrix,
+                                             colData = FinalTechnicalDF,
+                                             design = ~ 1)
+ddsForNormalization <- estimateSizeFactors(ddsForNormalization)
+NormalizedCountsMatrix = counts(ddsForNormalization, normalized = TRUE)
+MySizeFactorsAll = sizeFactors(ddsForNormalization)
+
+## Even though some objects include "Nontesting" in the name, here I am not using test
+## sets, so all objects contain all 1815 samples, except the ForCorrection objects 
+## which only contain 376 samples.
+
+  ## Defining Uncorrected Count (UC) Matrices 
+  ## (uncorrected means it has not yet been corrected for technical variables):
+  NonTestingAndOtherUCMatrix = RawCountMatrix[, CurrentBarcodesToAnalyze] 
+  ForCorrectionUCMatrix = NormalizedCountsMatrix[, BarcodesOfTestAndControlKids] 
+  
+  ## Defining Metadata:
+  NonTestingAndOtherMetadata = Metadata[CurrentBarcodesToAnalyze,] 
+  ForCorrectionMetadata = Metadata[BarcodesOfTestAndControlKids, CovariateArray]
+  
+  
+  ##==============================================================================
+  ## Running DESeq2 Differential Expression Analysis for Technical Variables 
+  ## so that we can obtain the coefficients for the technical variables
+  ## that allow us to correct the counts for the technical variables:
+  ##==============================================================================
+  
+  ## Running functions from DESeq2:
+  dds = DESeqDataSetFromMatrix(countData = NonTestingAndOtherUCMatrix, 
+                               colData = NonTestingAndOtherMetadata, 
+                               design = MyDesignFormula)   
+  
+  dds = DESeq(dds)
+  ddsOriginal = dds
+  CorrectionConvergenceFilter = which(mcols(dds)$betaConv)
+  dds = dds[CorrectionConvergenceFilter,]
+  
+  CoefficientMatrix = coef(dds)
+  
+  print('DESeq done')
+  ##==============================================================================
+  ## Correcting the Count Matrix:
+  ##==============================================================================
+  
+  ## This is the number of RNAs after removal of low count RNAs and 
+  ## RNAs whose coefficients did not converge:
+  NumberOfAllRNAsPresently = dim(CoefficientMatrix)[1] 
+
+  ## ConvergenceFilter is the RNAs that converged during the DESeq2 analysis of 
+  ## all the non-testing and other samples used for batch and technical variable 
+  ## information. For any RNAs that did not converge, we can't determine coefficients, 
+  ## so we can't correct that RNA's counts. Thus we get rid of those RNAs by applying 
+  ## the filter to the ForCorrectionUCMatrix:
+  ForCorrectionUCMatrixConverged = ForCorrectionUCMatrix[CorrectionConvergenceFilter,] 
+  NewCountMatrix = ForCorrectionUCMatrixConverged
+  
+  MetadataFCC = ForCorrectionMetadata[,-1] ## The -1 removes the Sequencing Batch info
+  CoefficientMatrixFCC = CoefficientMatrix[,7:(6+NumberOfTechnicalVariablesBB)]
+  ## 7 is here because there is 1 column for the intercept and 5 columns for Sequencing batches.
+  BatchCoefficientMatrixFCC = CoefficientMatrix[,2:6]
+  
+  
+  ##----------------------------------------------------------------------------
+  ## Correcting for Technical Variables (not including sequencing batch):
+  ##----------------------------------------------------------------------------
+  for (j in 1:NumberOfKidsOfInterest) {
+    if (class(MetadataFCC)=="data.frame") {
+      CurrentCovariateValues = as.numeric(MetadataFCC[j, ])
+    } else {
+      CurrentCovariateValues = as.numeric(MetadataFCC[j])
+    }
+    
+    for (i in 1:NumberOfAllRNAsPresently) {
+      CurrentCoefficentArray = as.numeric(CoefficientMatrixFCC[i, ])
+     
+      CorrectionFactor = 2^(CurrentCoefficentArray %*% CurrentCovariateValues) 
+      NewCountMatrix[i,j] = ForCorrectionUCMatrixConverged[i,j]/(CorrectionFactor) 
+    }
+  }
+  CorrectedCountMatrix = NewCountMatrix
+  
+  
+  ##----------------------------------------------------------------------------
+  ## Correcting for Sequencing Batch:
+  ##----------------------------------------------------------------------------
+  for (j in 1:NumberOfKidsOfInterest) {
+    CurrentBatch = as.numeric(ForCorrectionMetadata[j, 1]) - 1 ## This is the sequencing batch
+    ## The -1 is there because as.numeric adds 1 due to there being a batch 0.
+    
+    for (i in 1:NumberOfAllRNAsPresently) {
+      ## The first entry is batch 1vs0. The 2nd entry is batch 2vs0. etc.
+      BatchCoefficient = BatchCoefficientMatrixFCC[i, CurrentBatch]
+      if (CurrentBatch == 0) {
+        BatchCorrectionFactor = 1
+      } else {
+        BatchCorrectionFactor = 2 ^ (BatchCoefficient)
+      }
+      CorrectedCountMatrix[i, j] = NewCountMatrix[i, j] / BatchCorrectionFactor
+    }
+    
+  }
+  
+
+
+#  write.csv(CorrectedCountMatrix, "CorrectedCountMatrixForCordBlood.csv", row.names = TRUE)
+
+```
+
+
+
+## Getting the Ensembl IDs of the LM22 genes:
+
+```{r}
+
+LM22 = read.table('LM22.txt', sep='\t', header=TRUE)
+
+LM22GeneSymbols = LM22[,1]
+LM22SymbolsAndEnsembls = bitr(LM22GeneSymbols, fromType="SYMBOL", toType=c("ENSEMBL"), OrgDb="org.Hs.eg.db")
+rownames(LM22SymbolsAndEnsembls) = LM22SymbolsAndEnsembls$ENSEMBL
+LM22Ensembls = LM22SymbolsAndEnsembls[,'ENSEMBL']
+
+```
+
+
+## Determining which of the LM22 genes we measured, and determining their lengths:
+
+```{r}
+
+LengthMatrix = getGeneLengthAndGCContent(LM22Ensembls, 'hsa', mode=c("biomart"))
+
+## Just getting a sense of how many gene symbols have multiple Ensembl IDs:
+GeneLengthsWithDuplicates = as.numeric(LengthMatrix[,1])
+DuplicatedLogicals = duplicated(GeneLengthsWithDuplicates)
+GeneLengths = GeneLengthsWithDuplicates[!DuplicatedLogicals]
+length(GeneLengths)
+
+## Creating the GeneDF of symbols, ensembls, and lengths:
+GeneDF = cbind(LM22SymbolsAndEnsembls, LengthMatrix)
+DuplicatedSymbolLogicals = duplicated(GeneDF$SYMBOL)
+DuplicatedSymbols = GeneDF[DuplicatedSymbolLogicals,'SYMBOL']
+
+##------------------------------------------------------------------------------
+## Getting genes we measured:
+AllEnsemblIDs = rownames(CorrectedCountMatrix) #rownames(RawCountMatrix)
+IndsOfEnsemblsWeMeasured = which((GeneDF$ENSEMBL %in% AllEnsemblIDs) == TRUE)
+GeneDFWeMeasured = GeneDF[IndsOfEnsemblsWeMeasured,]
+
+## Seeing which of the genes we measured have duplicated symbols.
+## DS stands for Duplicated Symbols:
+IndsOfGenesWeMeasuredWithDS = which((GeneDFWeMeasured$SYMBOL %in% DuplicatedSymbols) == TRUE)
+SymbolsOfGenesWeMeasuredWithDS = GeneDFWeMeasured[IndsOfGenesWeMeasuredWithDS,'SYMBOL']
+
+## Looking at the lengths of the Ensembls of the genes we measured that have duplicated symbols:
+GeneDFOfImportantDuplicates = GeneDF[(GeneDF$SYMBOL %in% SymbolsOfGenesWeMeasuredWithDS),]
+
+## After looking through GeneDFOfImportantDuplicates, the following gene symbols have multiple EnsemblIDs that are quite different in length, so I will not feed these genes into Cibersortx because I don't know which EnsemblID they used in LM22:
+GenesToNotUse = c('APOBEC3A', 	
+'BLK',
+'CCL4',
+'CCL5',
+'HLA-DQA1',
+'IGSF6',
+'KIR2DL1',
+'KIR2DL4',
+'KIR2DS4',
+'KIR3DL2',
+'LAIR2',
+'LILRA2',
+'LILRA4',
+'LILRB2',
+'LTB',
+'MGAM')
+
+EntrezToNotUse = c(200315,
+640,
+6351,
+6352,
+3117,
+10261,
+3802,
+3805,
+3809,
+3812,
+3904,
+11027,
+23547,
+10288,
+4050,
+8972)
+
+## Now we remove the GenesToNotUse from GeneDFWeMeasured:
+LogicalsToNotUse = GeneDFWeMeasured$SYMBOL %in% GenesToNotUse
+GeneDFWeMeasuredReduced = GeneDFWeMeasured[!LogicalsToNotUse,]
+
+## After looking through GeneDFOfImportantDuplicates, the following gene symbols each have two Ensembls, where one of the Ensembls is NA. Therefore, use the gene length of the ensembl that is not NA length.
+GenesWithNALengths = c('BCL7A',
+'MAP4K1')
+## I checked GeneDFWeMeasuredReduced, and the lengths for these two genes were fine (i.e. not NA)
+
+
+##-------
+## Converting the entrez id's of the genes with duplicates to be ensembl ids:
+GNTUEntrezEnsemblSymbol = bitr(EntrezToNotUse, fromType="ENTREZID", toType=c("ENSEMBL","SYMBOL"), OrgDb="org.Hs.eg.db")
+## GNTU stands for Genes Not To Use.
+
+
+```
+
+
+## TPM normalization of the RNA count matrix:
+
+```{r}
+
+GeneLengthsToUse = GeneDFWeMeasuredReduced$length
+EnsemblsToUse = GeneDFWeMeasuredReduced$ENSEMBL
+CountMatrixReduced = CorrectedCountMatrix[EnsemblsToUse,c(BarcodesOfTestKids,BarcodesOfControlKids)]
+CountMatrixReduced[1,1] = as.numeric(CountMatrixReduced[1,1])
+CountMatrixReducedMatrix = as.matrix(CountMatrixReduced)
+
+## Normalizing:
+CountMatrixTPM = convertCounts(CountMatrixReducedMatrix,
+                            unit = "tpm",
+                            geneLength = GeneLengthsToUse,
+                            log = FALSE)
+
+## Renaming Ensembls to symbols in the count matrix:
+SymbolsToUse = LM22SymbolsAndEnsembls[EnsemblsToUse,'SYMBOL']
+CountMatrixForCibersortx = as.data.frame(CountMatrixTPM)
+rownames(CountMatrixForCibersortx) = SymbolsToUse
+
+#write.table(CountMatrixForCibersortx, file = "TPMCorrectedCountMatrixForTB.txt", sep = "\t",
+#            row.names = TRUE, col.names = TRUE)
+
+## IMPORTANT: After writing the table, you have to open the txt file in excel, and in the first cell put:
+## Gene symbol
+## Then in excel, save the file as a txt file.
+
+
+## Now you are ready to use CIBERSORTx at https://cibersortx.stanford.edu/
+```
