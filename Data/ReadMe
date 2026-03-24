@@ -1,1 +1,15 @@
-This folder contains all data needed to run our analyses, except RNA expression count matrices.
+This folder contains all data needed to run our analyses, except RNA expression count matrices, which will be added here upon publication of the paper.
+
+Due to file size limitations on GitHub, the RNA count matrix is divided into 18 files, with each file containing 100 samples (except the 18th file, which contains 115 samples). Of the 1815 samples, only 376 samples were analyzed in our paper, though the remaining 1439 were utilized when correcting the RNA counts for technical variables. If using the data, we suggest that you combine the 18 files into one excel spreadsheet.
+
+The top row of the RNA count matrices contain 6 digit barcodes, which correspond to each blood sample. In R, open the file BarcodesOfOutcomeGroups.RData, which shows which barcodes belong to each group. The following are the groups contained in BarcodesOfOutcomeGroups.RData:
+BarcodesOfTB: Cord blood samples of children who were diagnosed with TB disease before their 11th birthdays.
+BarcodesOfNonInfected: Cord blood samples of children who were never diagnosed with TB disease and never had a postive TST before their 11th birthdays.
+BarcodesOfAINoIsoniazid: Cord blood samples of children who had positive TSTs before their 11th birthdays but did not progress to TB disease AND did not receive isoniazid prophylaxis (AI stands for asymptomatic infected).
+BarcodesOfInfectedOrTB: Cord blood samples of children who had positive TSTs or TB diagnoses before their 11th birthdays. (This includes children who received isoniazid prophylaxis and children who did not receive isoniazid).
+BarcodesOfNonDisease: Samples of children who were never diagnosed with TB disease before their 11th birthdays. (This incudes children who had a postive TST and children who never had a positive TST).
+Some of these groups overlap - i.e. there are barcodes that fit into more than one of these groupings. 
+
+In R, open AgesOfTSTConversionAndTBDiagnosis.RData to see the ages at which children were diagnosed with TB disease (see the object AgesOfTBDiagnosisDF). See the object AgeOfTSTConversionDF to see the ages at which children TST converted (note that if the age says 0, it indicates the child never TST converted).
+
+The other files in this folder contain the demographic/clinical covariates or technical covariates.
